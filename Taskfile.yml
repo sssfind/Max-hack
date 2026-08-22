@@ -1,18 +1,39 @@
 version: '3'
 
-tasks:
-  lint:
-    desc: "Проверить код линтером"
-    cmd: golangci-lint run ./...
+vars:
+  BIN_DIR: '{{.ROOT_DIR}}/bin'
+  GOLANGCI_LINT: '{{.BIN_DIR}}/golangci-lint'
 
-  lint-fix:
-    desc: "Автоматически исправить простые ошибки (форматирование, импорты)"
-    cmd: golangci-lint run --fix ./...
+tasks:
+  install-lint:
+    desc: "Устанавливает golangci-lint в каталог bin"
+    cmds:
+      - |
+        [ -f {{.GOLANGCI_LINT}} ] || {
+          mkdir -p {{.BIN_DIR}}
+          echo "📦 Устанавливаем golangci-lint..."
+          GOBIN={{.BIN_DIR}} go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+        }
+    status:
+      - test -x {{.GOLANGCI_LINT}}
+
+  lint:
+    desc: "Запускает линтер для проекта"
+    deps: [ install-lint ]
+    cmds:
+      - '{{.GOLANGCI_LINT}} run ./... --timeout=3m'
+
+  test:
+    desc: "Запускает юнит-тесты"
+    cmds:
+      - go test -v ./...
 
   up:
     desc: "Поднять всю инфраструктуру"
-    cmd: docker-compose up -d --build
+    cmds:
+      - docker-compose up -d --build
 
   down:
     desc: "Убить контейнеры и очистить вольюмы"
-    cmd: docker-compose down -v
+    cmds:
+      - docker-compose down -v

@@ -1,0 +1,33 @@
+name: CI Pipeline
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Install Task
+        uses: arduino/setup-task@v2.0.0
+
+      - name: Cache bin directory
+        uses: actions/cache@v4
+        with:
+          path: bin/
+          key: ${{ runner.os }}-go-bin-${{ hashFiles('Taskfile.yml') }}
+
+      - name: Run Linter
+        run: task lint
+
+      - name: Run Tests
+        run: task test
