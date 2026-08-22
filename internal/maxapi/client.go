@@ -25,7 +25,6 @@ type Client struct {
 	token      string
 
 	// Менеджер лимитеров. Ключ - chat_id
-	mu       sync.RWMutex
 	limiters sync.Map
 }
 

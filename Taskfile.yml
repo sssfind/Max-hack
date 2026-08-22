@@ -1,0 +1,18 @@
+version: '3'
+
+tasks:
+  lint:
+    desc: "Проверить код линтером"
+    cmd: golangci-lint run ./...
+
+  lint-fix:
+    desc: "Автоматически исправить простые ошибки (форматирование, импорты)"
+    cmd: golangci-lint run --fix ./...
+
+  up:
+    desc: "Поднять всю инфраструктуру"
+    cmd: docker-compose up -d --build
+
+  down:
+    desc: "Убить контейнеры и очистить вольюмы"
+    cmd: docker-compose down -v
