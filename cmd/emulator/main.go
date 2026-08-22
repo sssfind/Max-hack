@@ -10,9 +10,9 @@ import (
 )
 
 const (
-	webhookURL = "http://localhost:8080/webhook"
+	webhookURL = "http://localhost/webhook"
 
-	secret = "your_webhook_secret_here"
+	secret = "your_real_webhook_secret_here"
 )
 
 type Update struct {

@@ -1,6 +1,5 @@
 FROM golang:1.26-alpine AS builder
 
-# Отключаем CGO для статической линковки бинарника (чтобы он запустился в чистом alpine)
 ENV CGO_ENABLED=0 \
     GOOS=linux \
     GOARCH=amd64
@@ -12,10 +11,10 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 # Копируем остальной исходный код
-COPY deploy/docker/core .
+COPY . .
 
-RUN go build -ldflags="-w -s" -o max-bot ./bot/cmd/main.go
-RUN go build -ldflags="-w -s" -o migrator ./bot/cmd/migrator/main.go
+RUN go build -ldflags="-w -s" -o max-bot ./cmd/bot/main.go
+RUN go build -ldflags="-w -s" -o migrator ./cmd/migrator/main.go
 
 FROM alpine:3.19
 
@@ -34,6 +33,6 @@ WORKDIR /app
 COPY --from=builder /app/max-bot .
 COPY --from=builder /app/migrator .
 
-RUN chmod +x ./max-bot
+RUN chmod +x ./max-bot ./migrator
 
 CMD ["./max-bot"]

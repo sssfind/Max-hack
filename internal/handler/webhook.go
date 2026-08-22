@@ -1,8 +1,8 @@
 package handler
 
 import (
-	"bot/internal/maxapi"
-	"bot/internal/worker"
+	"Max-hack/internal/maxapi"
+	"Max-hack/internal/worker"
 	"encoding/json"
 	"log/slog"
 	"net/http"

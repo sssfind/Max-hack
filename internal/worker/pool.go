@@ -1,7 +1,7 @@
 package worker
 
 import (
-	"bot/internal/maxapi"
+	"Max-hack/internal/maxapi"
 	"context"
 	"log/slog"
 

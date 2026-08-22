@@ -1,9 +1,9 @@
 package main
 
 import (
-	"bot/internal/handler"
-	"bot/internal/maxapi"
-	"bot/internal/worker"
+	"Max-hack/internal/handler"
+	"Max-hack/internal/maxapi"
+	"Max-hack/internal/worker"
 	"context"
 	"errors"
 	"log/slog"

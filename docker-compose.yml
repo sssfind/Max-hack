@@ -21,7 +21,7 @@ services:
 
   migrator:
     build:
-      context: deploy/compose/core
+      context: .
       dockerfile: Dockerfile
     command: [ "./migrator" ]
     environment:
@@ -34,7 +34,7 @@ services:
 
   app:
     build:
-      context: deploy/compose/core
+      context: .
       dockerfile: Dockerfile
     command: ["./max-bot"]
     restart: always
@@ -57,10 +57,10 @@ services:
     restart: always
     ports:
       - "80:80"
-      - "443:443"
+    #  - "443:443"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
-      - /etc/letsencrypt:/etc/letsencrypt:ro
+    #  - /etc/letsencrypt:/etc/letsencrypt:ro
     depends_on:
       - app
     networks:
