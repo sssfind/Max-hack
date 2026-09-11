@@ -19,7 +19,6 @@ import (
 )
 
 func main() {
-	// 1. Читаем конфигурацию
 	dbURL := os.Getenv("DATABASE_URL")
 	botToken := os.Getenv("MAX_BOT_TOKEN")
 	webhookSecret := os.Getenv("MAX_WEBHOOK_SECRET")
@@ -29,7 +28,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 2. Инициализация БД
 	dbConfig, err := pgxpool.ParseConfig(dbURL)
 	if err != nil {
 		slog.Error("Failed to parse database URL", "error", err)
