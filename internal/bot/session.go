@@ -12,7 +12,7 @@ const (
 	stepReady        step = "ready"
 )
 
-// session хранит прогресс сценария «Выбор направления» для пользователя.
+// session хранит прогресс сценария «Выбор направления» для диалога (chat_id).
 type session struct {
 	Step           step
 	RegionShort    string
@@ -24,30 +24,32 @@ type session struct {
 	SearchRegions  []string // short-коды регионов из последнего поиска
 }
 
+// sessionStore ключует сессии по chat_id: в message_created user_id часто пустой,
+// а chat_id стабилен и для текста, и для callback.
 type sessionStore struct {
-	mu   sync.Mutex
-	byID map[int64]*session
+	mu     sync.Mutex
+	byChat map[int64]*session
 }
 
 func newSessionStore() *sessionStore {
-	return &sessionStore{byID: make(map[int64]*session)}
+	return &sessionStore{byChat: make(map[int64]*session)}
 }
 
-func (s *sessionStore) get(userID int64) *session {
+func (s *sessionStore) get(chatID int64) *session {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	sess, ok := s.byID[userID]
+	sess, ok := s.byChat[chatID]
 	if !ok {
 		sess = &session{}
-		s.byID[userID] = sess
+		s.byChat[chatID] = sess
 	}
 	return sess
 }
 
-func (s *sessionStore) reset(userID int64) *session {
+func (s *sessionStore) reset(chatID int64) *session {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sess := &session{Step: stepAwaitRegion}
-	s.byID[userID] = sess
+	s.byChat[chatID] = sess
 	return sess
 }

@@ -60,11 +60,11 @@ type MessageBody struct {
 }
 
 type Message struct {
-	Sender    *User      `json:"sender,omitempty"`
-	Recipient Recipient  `json:"recipient"`
-	Timestamp int64      `json:"timestamp"`
+	Sender    *User       `json:"sender,omitempty"`
+	Recipient Recipient   `json:"recipient"`
+	Timestamp int64       `json:"timestamp"`
 	Body      MessageBody `json:"body"`
-	URL       *string    `json:"url,omitempty"`
+	URL       *string     `json:"url,omitempty"`
 }
 
 type Callback struct {
@@ -106,11 +106,11 @@ func (u Update) ResolvedUserID() int64 {
 	if u.UserID != 0 {
 		return u.UserID
 	}
-	if u.Message != nil && u.Message.Sender != nil {
-		return u.Message.Sender.UserID
-	}
 	if u.Callback != nil && u.Callback.User.UserID != 0 {
 		return u.Callback.User.UserID
+	}
+	if u.Message != nil && u.Message.Sender != nil && u.Message.Sender.UserID != 0 {
+		return u.Message.Sender.UserID
 	}
 	return 0
 }

@@ -101,7 +101,13 @@ func (h *Handler) onMessage(ctx context.Context, update maxapi.Update) {
 		return
 	}
 
-	sess := h.sessions.get(userID)
+	sess := h.sessions.get(chatID)
+	slog.Info("SkillGap message",
+		"chat_id", chatID,
+		"user_id", userID,
+		"step", string(sess.Step),
+		"text", text,
+	)
 	switch sess.Step {
 	case stepAwaitRegion:
 		h.handleRegionText(ctx, chatID, userID, sess, text)
@@ -123,6 +129,7 @@ func (h *Handler) onCallback(ctx context.Context, update maxapi.Update) {
 	chatID := update.ResolvedChatID()
 	userID := update.ResolvedUserID()
 	payload := update.Callback.Payload
+	slog.Info("SkillGap callback", "chat_id", chatID, "user_id", userID, "payload", payload)
 
 	var (
 		msgText string
@@ -136,19 +143,19 @@ func (h *Handler) onCallback(ctx context.Context, update maxapi.Update) {
 		notify = "Справка"
 		kb = startKeyboardRows()
 	case payload == payloadBegin, payload == payloadRestart:
-		msgText, kb = h.beginDirectionContent(userID)
+		msgText, kb = h.beginDirectionContent(chatID)
 		notify = "Выбор направления"
 	case strings.HasPrefix(payload, payloadRegPref):
 		short := strings.TrimPrefix(payload, payloadRegPref)
-		msgText, kb, notify = h.selectRegion(userID, short)
+		msgText, kb, notify = h.selectRegion(chatID, short)
 	case strings.HasPrefix(payload, payloadProgPref):
 		code := strings.TrimPrefix(payload, payloadProgPref)
-		msgText, kb, notify = h.selectProgram(userID, code)
+		msgText, kb, notify = h.selectProgram(chatID, code)
 	case strings.HasPrefix(payload, payloadQualPref):
 		idx, _ := strconv.Atoi(strings.TrimPrefix(payload, payloadQualPref))
-		msgText, kb, notify = h.selectQualification(userID, idx)
+		msgText, kb, notify = h.selectQualification(chatID, idx)
 	case payload == payloadAnalyze:
-		msgText, kb, notify = h.analyzeStub(userID)
+		msgText, kb, notify = h.analyzeStub(chatID)
 	default:
 		msgText = "Неизвестная кнопка. Нажми «Выбрать направление»."
 		notify = "ок"
@@ -168,14 +175,14 @@ func (h *Handler) onCallback(ctx context.Context, update maxapi.Update) {
 }
 
 func (h *Handler) beginDirection(ctx context.Context, chatID, userID int64) {
-	text, kb := h.beginDirectionContent(userID)
+	text, kb := h.beginDirectionContent(chatID)
 	if err := h.send(ctx, chatID, userID, text, kb); err != nil {
 		slog.Error("Failed to begin direction", "error", err, "chat_id", chatID)
 	}
 }
 
-func (h *Handler) beginDirectionContent(userID int64) (string, [][]maxapi.Button) {
-	h.sessions.reset(userID)
+func (h *Handler) beginDirectionContent(chatID int64) (string, [][]maxapi.Button) {
+	h.sessions.reset(chatID)
 	text := "Шаг 1/3 — регион\n\nВыбери регион кнопкой или напиши название (например: «Татарстан», «Новосибирская»)."
 	return text, regionKeyboardRows()
 }
@@ -208,8 +215,8 @@ func (h *Handler) handleRegionText(ctx context.Context, chatID, userID int64, se
 	_ = h.send(ctx, chatID, userID, b.String(), rows)
 }
 
-func (h *Handler) selectRegion(userID int64, short string) (string, [][]maxapi.Button, string) {
-	sess := h.sessions.get(userID)
+func (h *Handler) selectRegion(chatID int64, short string) (string, [][]maxapi.Button, string) {
+	sess := h.sessions.get(chatID)
 	r, ok := catalog.RegionByShort(short)
 	if !ok {
 		return "Неизвестный регион. Выбери из списка.", regionKeyboardRows(), "ошибка"
@@ -269,8 +276,8 @@ func (h *Handler) handleProgramText(ctx context.Context, chatID, userID int64, s
 	_ = h.send(ctx, chatID, userID, b.String(), rows)
 }
 
-func (h *Handler) selectProgram(userID int64, code string) (string, [][]maxapi.Button, string) {
-	sess := h.sessions.get(userID)
+func (h *Handler) selectProgram(chatID int64, code string) (string, [][]maxapi.Button, string) {
+	sess := h.sessions.get(chatID)
 	p, ok := h.catalog.Get(code)
 	if !ok {
 		return "Программа не найдена. Напиши код или название ещё раз.",
@@ -312,8 +319,8 @@ func (h *Handler) applyProgram(sess *session, p *catalog.Program) (string, [][]m
 	return b.String(), h.qualKeyboard(sess), p.Code
 }
 
-func (h *Handler) selectQualification(userID int64, idx int) (string, [][]maxapi.Button, string) {
-	sess := h.sessions.get(userID)
+func (h *Handler) selectQualification(chatID int64, idx int) (string, [][]maxapi.Button, string) {
+	sess := h.sessions.get(chatID)
 	p, ok := h.catalog.Get(sess.ProgramCode)
 	if !ok {
 		return "Сначала выбери программу СПО.", [][]maxapi.Button{{maxapi.CallbackButton("🔄 Заново", payloadRestart)}}, "ошибка"
@@ -365,8 +372,8 @@ func (h *Handler) formatRoles(p *catalog.Program, qualification string) string {
 	return b.String()
 }
 
-func (h *Handler) analyzeStub(userID int64) (string, [][]maxapi.Button, string) {
-	sess := h.sessions.get(userID)
+func (h *Handler) analyzeStub(chatID int64) (string, [][]maxapi.Button, string) {
+	sess := h.sessions.get(chatID)
 	if sess.Step != stepReady || sess.RegionCode == "" || sess.ProgramCode == "" {
 		return "Сначала заверши выбор направления (регион и программа СПО).", startKeyboardRows(), "не готово"
 	}
