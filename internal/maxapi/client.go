@@ -18,7 +18,7 @@ import (
 
 const (
 	baseURL         = "https://platform-api2.max.ru"
-	limitPerSec     = rate.Limit(2)  // max 2 messages/answers per chat per second
+	limitPerSec     = rate.Limit(2) // max 2 messages/answers per chat per second
 	burstCapacity   = 1
 	globalLimitRPS  = rate.Limit(25) // docs recommend ≤30 rps to the platform
 	globalBurst     = 10
@@ -222,6 +222,10 @@ func InlineKeyboard(rows ...[]Button) AttachmentRequest {
 
 func CallbackButton(text, payload string) Button {
 	return Button{Type: "callback", Text: text, Payload: payload}
+}
+
+func LinkButton(text, url string) Button {
+	return Button{Type: "link", Text: text, URL: url}
 }
 
 func Ptr[T any](v T) *T { return &v }

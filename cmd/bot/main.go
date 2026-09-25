@@ -2,6 +2,7 @@ package main
 
 import (
 	"Max-hack/internal/bot"
+	"Max-hack/internal/catalog"
 	"Max-hack/internal/handler"
 	"Max-hack/internal/maxapi"
 	"Max-hack/internal/worker"
@@ -54,8 +55,19 @@ func main() {
 	}
 	slog.Info("Connected to PostgreSQL")
 
+	catalogPath := strings.TrimSpace(os.Getenv("SKILLGAP_CATALOG_PATH"))
+	if catalogPath == "" {
+		catalogPath = "spo_program_vacancy_map.json"
+	}
+	spoCatalog, err := catalog.Load(catalogPath)
+	if err != nil {
+		slog.Error("Failed to load SPO catalog", "error", err, "path", catalogPath)
+		os.Exit(1)
+	}
+	slog.Info("SPO catalog loaded", "programs", spoCatalog.Len(), "path", catalogPath)
+
 	maxClient := maxapi.NewClient(botToken)
-	botHandler := bot.NewHandler(maxClient)
+	botHandler := bot.NewHandler(maxClient, spoCatalog)
 
 	startupCtx, cancelStartup := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancelStartup()
@@ -68,8 +80,9 @@ func main() {
 	slog.Info("Bot authorized", "user_id", info.UserID, "name", info.FirstName, "username", info.Username)
 
 	commands := []maxapi.BotCommand{
-		{Name: "start", Description: "Начать диалог"},
+		{Name: "start", Description: "Начать диалог SkillGap"},
 		{Name: "help", Description: "Справка по командам"},
+		{Name: "skillgap", Description: "Выбрать направление (регион и СПО)"},
 	}
 	if err := maxClient.SetCommands(startupCtx, commands); err != nil {
 		slog.Warn("Failed to register bot commands", "error", err)
