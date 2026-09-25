@@ -38,9 +38,12 @@ services:
       dockerfile: Dockerfile
     command: ["./max-bot"]
     restart: always
+    ports:
+      - "127.0.0.1:8080:8080"
     environment:
       - MAX_BOT_TOKEN=${MAX_BOT_TOKEN}
       - MAX_WEBHOOK_SECRET=${MAX_WEBHOOK_SECRET}
+      - MAX_WEBHOOK_URL=${MAX_WEBHOOK_URL:-}
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}?sslmode=disable
     depends_on:
       db:
@@ -51,20 +54,20 @@ services:
       - max-network
 
 
-  nginx:
-    image: nginx:alpine
-    container_name: max-nginx
-    restart: always
-    ports:
-      - "8080:80"
-    #  - "443:443"
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
-    #  - /etc/letsencrypt:/etc/letsencrypt:ro
-    depends_on:
-      - app
-    networks:
-      - max-network
+#  nginx:
+#    image: nginx:alpine
+#    container_name: max-nginx
+#    restart: always
+#    ports:
+#      - "8080:80"
+#      - "443:443"
+#    volumes:
+#      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+#      - /etc/letsencrypt:/etc/letsencrypt:ro
+#    depends_on:
+#      - app
+#    networks:
+#      - max-network
 
   prometheus:
     image: prom/prometheus:v2.53.0

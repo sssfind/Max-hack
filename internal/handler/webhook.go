@@ -17,7 +17,6 @@ func NewWebhookHandler(pool *worker.Pool) *WebhookHandler {
 }
 
 func (h *WebhookHandler) Handle(w http.ResponseWriter, r *http.Request) {
-
 	var update maxapi.Update
 	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
 		slog.Error("Failed to decode webhook payload", "error", err)
@@ -25,7 +24,10 @@ func (h *WebhookHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.pool.Submit(update)
+	if !h.pool.Submit(update) {
+		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
+		return
+	}
 
 	w.WriteHeader(http.StatusOK)
 }

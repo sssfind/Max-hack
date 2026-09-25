@@ -31,7 +31,7 @@ func main() {
 		go func(id int) {
 			defer wg.Done()
 			sendWebhook(client, Update{
-				UpdateType: "new_message",
+				UpdateType: "message_created",
 				Timestamp:  time.Now().UnixMilli(),
 				ChatID:     int64(id),
 			})
@@ -46,7 +46,7 @@ func main() {
 	log.Println("ФАЗА 2: Тест Идемпотентности")
 	// Имитируем поведение МАХ при нестабильной сети: одно и то же событие прилетает 5 раз
 	duplicateUpdate := Update{
-		UpdateType: "new_message",
+		UpdateType: "message_created",
 		Timestamp:  1690000000000, // Жестко зафиксированный таймстемп
 		ChatID:     999,           // Один и тот же чат
 	}
