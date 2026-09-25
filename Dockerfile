@@ -27,11 +27,8 @@ RUN wget -qO /usr/local/share/ca-certificates/russian_trusted_root_ca.crt https:
     update-ca-certificates
 
 COPY --from=builder /app/max-bot .
-
-WORKDIR /app
-
-COPY --from=builder /app/max-bot .
 COPY --from=builder /app/migrator .
+COPY --from=builder /app/spo_program_vacancy_map.json .
 
 RUN chmod +x ./max-bot ./migrator
 
