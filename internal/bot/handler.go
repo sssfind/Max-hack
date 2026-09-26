@@ -15,7 +15,7 @@ const (
 	payloadBegin    = "sg:begin"
 	payloadHelp     = "sg:help"
 	payloadRestart  = "sg:restart"
-	payloadAnalyze  = "sg:analyze"
+	payloadAnalyze  = "sg:analyze:"
 	payloadRegPref  = "sg:reg:"
 	payloadProgPref = "sg:p:"
 	payloadQualPref = "sg:q:"
@@ -26,17 +26,21 @@ const (
 
 // Handler — бизнес-логика ответов на Update (сценарий SkillGap).
 type Handler struct {
-	api      *maxapi.Client
+	api      messenger
 	catalog  *catalog.Catalog
 	sessions *sessionStore
+	analysis *analysisRunner
 }
 
-func NewHandler(api *maxapi.Client, cat *catalog.Catalog) *Handler {
-	return &Handler{
+func NewHandler(api messenger, cat *catalog.Catalog, analyzer marketAnalyzer, reports reportGenerator, cfg AnalysisConfig) *Handler {
+	sessions := newSessionStore()
+	h := &Handler{
 		api:      api,
 		catalog:  cat,
-		sessions: newSessionStore(),
+		sessions: sessions,
 	}
+	h.analysis = newAnalysisRunner(api, cat, sessions, analyzer, reports, cfg)
+	return h
 }
 
 func (h *Handler) Handle(ctx context.Context, update maxapi.Update) {
@@ -102,12 +106,7 @@ func (h *Handler) onMessage(ctx context.Context, update maxapi.Update) {
 	}
 
 	sess := h.sessions.get(chatID)
-	slog.Info("SkillGap message",
-		"chat_id", chatID,
-		"user_id", userID,
-		"step", string(sess.Step),
-		"text", text,
-	)
+	slog.Info("SkillGap message", "chat_id", chatID, "step", string(sess.Step), "text_length", utf8.RuneCountInString(text))
 	switch sess.Step {
 	case stepAwaitRegion:
 		h.handleRegionText(ctx, chatID, userID, sess, text)
@@ -117,6 +116,8 @@ func (h *Handler) onMessage(ctx context.Context, update maxapi.Update) {
 		_ = h.send(ctx, chatID, userID, "Выбери квалификацию кнопкой ниже или нажми «Заново».", h.qualKeyboard(sess))
 	case stepReady:
 		_ = h.send(ctx, chatID, userID, "Направление уже выбрано. Можно запустить анализ или начать заново.", h.readyKeyboard(sess))
+	case stepAnalyzing:
+		_ = h.send(ctx, chatID, userID, "Анализ уже выполняется. Я пришлю статистику и PDF отдельными сообщениями.", nil)
 	default:
 		_ = h.send(ctx, chatID, userID, "Чтобы начать, нажми «Выбрать направление».", startKeyboard())
 	}
@@ -127,9 +128,18 @@ func (h *Handler) onCallback(ctx context.Context, update maxapi.Update) {
 		return
 	}
 	chatID := update.ResolvedChatID()
-	userID := update.ResolvedUserID()
 	payload := update.Callback.Payload
-	slog.Info("SkillGap callback", "chat_id", chatID, "user_id", userID, "payload", payload)
+	slog.Info("SkillGap callback", "chat_id", chatID, "payload", payload)
+
+	if strings.HasPrefix(payload, payloadAnalyze) {
+		generation, programCode, ok := parseAnalyzePayload(strings.TrimPrefix(payload, payloadAnalyze))
+		if !ok {
+			h.answerAnalysisCallback(ctx, update, "Эта кнопка анализа устарела. Используй кнопку из последнего сообщения.", "устарело")
+			return
+		}
+		h.onAnalyzeCallback(ctx, update, generation, programCode)
+		return
+	}
 
 	var (
 		msgText string
@@ -152,23 +162,25 @@ func (h *Handler) onCallback(ctx context.Context, update maxapi.Update) {
 		code := strings.TrimPrefix(payload, payloadProgPref)
 		msgText, kb, notify = h.selectProgram(chatID, code)
 	case strings.HasPrefix(payload, payloadQualPref):
-		idx, _ := strconv.Atoi(strings.TrimPrefix(payload, payloadQualPref))
-		msgText, kb, notify = h.selectQualification(chatID, idx)
-	case payload == payloadAnalyze:
-		msgText, kb, notify = h.analyzeStub(chatID)
+		programCode, idx, ok := parseQualificationPayload(strings.TrimPrefix(payload, payloadQualPref))
+		if !ok {
+			msgText = "Некорректная кнопка квалификации. Начни выбор заново."
+			notify = "ошибка"
+			kb = startKeyboardRows()
+		} else {
+			msgText, kb, notify = h.selectQualification(chatID, programCode, idx)
+		}
 	default:
 		msgText = "Неизвестная кнопка. Нажми «Выбрать направление»."
 		notify = "ок"
 		kb = startKeyboardRows()
 	}
 
-	answer := maxapi.SendAnswerRequest{
-		Notification: &notify,
-		Message: &maxapi.NewMessageBody{
-			Text:        &msgText,
-			Attachments: []maxapi.AttachmentRequest{maxapi.InlineKeyboard(kb...)},
-		},
+	message := maxapi.NewMessageBody{Text: &msgText}
+	if len(kb) > 0 {
+		message.Attachments = []maxapi.AttachmentRequest{maxapi.InlineKeyboard(kb...)}
 	}
+	answer := maxapi.SendAnswerRequest{Notification: &notify, Message: &message}
 	if err := h.api.AnswerCallback(ctx, update.Callback.CallbackID, chatID, answer); err != nil {
 		slog.Error("Failed to answer callback", "error", err, "callback_id", update.Callback.CallbackID)
 	}
@@ -187,14 +199,14 @@ func (h *Handler) beginDirectionContent(chatID int64) (string, [][]maxapi.Button
 	return text, regionKeyboardRows()
 }
 
-func (h *Handler) handleRegionText(ctx context.Context, chatID, userID int64, sess *session, text string) {
+func (h *Handler) handleRegionText(ctx context.Context, chatID, userID int64, sess session, text string) {
 	hits := catalog.SearchRegions(text, maxSearchHits)
 	if len(hits) == 0 {
 		_ = h.send(ctx, chatID, userID, "Регион не найден. Попробуй ещё раз или выбери из популярных.", regionKeyboardRows())
 		return
 	}
 	if len(hits) == 1 {
-		msg, kb, _ := h.applyRegion(sess, hits[0])
+		msg, kb, _ := h.applyRegion(chatID, sess.Generation, hits[0])
 		_ = h.send(ctx, chatID, userID, msg, kb)
 		return
 	}
@@ -211,28 +223,41 @@ func (h *Handler) handleRegionText(ctx context.Context, chatID, userID int64, se
 			maxapi.CallbackButton(truncate(r.Name, maxButtonLabel), payloadRegPref+r.Short),
 		})
 	}
+	if _, ok := h.sessions.updateIf(chatID, sess.Generation, stepAwaitRegion, func(current *session) {
+		current.SearchRegions = append([]string(nil), sess.SearchRegions...)
+	}); !ok {
+		_ = h.send(ctx, chatID, userID, "Выбор уже изменился. Используй кнопки из последнего сообщения.", startKeyboardRows())
+		return
+	}
 	rows = append(rows, []maxapi.Button{maxapi.CallbackButton("🔄 Заново", payloadRestart)})
 	_ = h.send(ctx, chatID, userID, b.String(), rows)
 }
 
 func (h *Handler) selectRegion(chatID int64, short string) (string, [][]maxapi.Button, string) {
 	sess := h.sessions.get(chatID)
+	if sess.Step != stepAwaitRegion {
+		return staleSelectionMessage(sess)
+	}
 	r, ok := catalog.RegionByShort(short)
 	if !ok {
 		return "Неизвестный регион. Выбери из списка.", regionKeyboardRows(), "ошибка"
 	}
-	msg, kb, _ := h.applyRegion(sess, r)
-	return msg, kb, r.Name
+	return h.applyRegion(chatID, sess.Generation, r)
 }
 
-func (h *Handler) applyRegion(sess *session, r catalog.Region) (string, [][]maxapi.Button, string) {
-	sess.RegionShort = r.Short
-	sess.RegionCode = r.Code
-	sess.RegionName = r.Name
-	sess.ProgramCode = ""
-	sess.Qualification = ""
-	sess.SearchPrograms = nil
-	sess.Step = stepAwaitProgram
+func (h *Handler) applyRegion(chatID int64, generation uint64, r catalog.Region) (string, [][]maxapi.Button, string) {
+	if _, ok := h.sessions.updateIf(chatID, generation, stepAwaitRegion, func(sess *session) {
+		sess.RegionShort = r.Short
+		sess.RegionCode = r.Code
+		sess.RegionName = r.Name
+		sess.ProgramCode = ""
+		sess.Qualification = ""
+		sess.SearchPrograms = nil
+		sess.SearchRegions = nil
+		sess.Step = stepAwaitProgram
+	}); !ok {
+		return staleSelectionMessage(h.sessions.get(chatID))
+	}
 	msg := fmt.Sprintf(
 		"Регион: %s\n\nШаг 2/3 — программа СПО\n\nНапиши код (например 09.02.07) или название программы / специальности.",
 		r.Name,
@@ -241,7 +266,7 @@ func (h *Handler) applyRegion(sess *session, r catalog.Region) (string, [][]maxa
 	return msg, kb, r.Name
 }
 
-func (h *Handler) handleProgramText(ctx context.Context, chatID, userID int64, sess *session, text string) {
+func (h *Handler) handleProgramText(ctx context.Context, chatID, userID int64, sess session, text string) {
 	hits := h.catalog.Search(text, maxSearchHits)
 	if len(hits) == 0 {
 		_ = h.send(ctx, chatID, userID,
@@ -251,7 +276,7 @@ func (h *Handler) handleProgramText(ctx context.Context, chatID, userID int64, s
 		return
 	}
 	if len(hits) == 1 {
-		msg, kb, _ := h.applyProgram(sess, hits[0])
+		msg, kb, _ := h.applyProgram(chatID, sess.Generation, hits[0])
 		_ = h.send(ctx, chatID, userID, msg, kb)
 		return
 	}
@@ -272,25 +297,49 @@ func (h *Handler) handleProgramText(ctx context.Context, chatID, userID int64, s
 			maxapi.CallbackButton(label, payloadProgPref+p.Code),
 		})
 	}
+	if _, ok := h.sessions.updateIf(chatID, sess.Generation, stepAwaitProgram, func(current *session) {
+		current.SearchPrograms = append([]string(nil), sess.SearchPrograms...)
+	}); !ok {
+		_ = h.send(ctx, chatID, userID, "Выбор уже изменился. Используй кнопки из последнего сообщения.", startKeyboardRows())
+		return
+	}
 	rows = append(rows, []maxapi.Button{maxapi.CallbackButton("🔄 Заново", payloadRestart)})
 	_ = h.send(ctx, chatID, userID, b.String(), rows)
 }
 
 func (h *Handler) selectProgram(chatID int64, code string) (string, [][]maxapi.Button, string) {
 	sess := h.sessions.get(chatID)
+	if sess.Step != stepAwaitProgram || !containsFold(sess.SearchPrograms, code) {
+		return staleSelectionMessage(sess)
+	}
 	p, ok := h.catalog.Get(code)
 	if !ok {
 		return "Программа не найдена. Напиши код или название ещё раз.",
 			[][]maxapi.Button{{maxapi.CallbackButton("🔄 Заново", payloadRestart)}},
 			"ошибка"
 	}
-	msg, kb, _ := h.applyProgram(sess, p)
-	return msg, kb, p.Code
+	return h.applyProgram(chatID, sess.Generation, p)
 }
 
-func (h *Handler) applyProgram(sess *session, p *catalog.Program) (string, [][]maxapi.Button, string) {
-	sess.ProgramCode = p.Code
-	sess.Qualification = ""
+func (h *Handler) applyProgram(chatID int64, generation uint64, p *catalog.Program) (string, [][]maxapi.Button, string) {
+	qualifications := append([]string(nil), p.Qualifications...)
+	sess, ok := h.sessions.updateIf(chatID, generation, stepAwaitProgram, func(sess *session) {
+		sess.ProgramCode = p.Code
+		sess.Qualification = ""
+		sess.SearchPrograms = nil
+		switch len(qualifications) {
+		case 0:
+			sess.Step = stepReady
+		case 1:
+			sess.Qualification = qualifications[0]
+			sess.Step = stepReady
+		default:
+			sess.Step = stepAwaitQual
+		}
+	})
+	if !ok {
+		return staleSelectionMessage(h.sessions.get(chatID))
+	}
 	status := "актуальна"
 	if !p.IsCurrent {
 		status = "историческая / приём может быть закрыт"
@@ -301,26 +350,25 @@ func (h *Handler) applyProgram(sess *session, p *catalog.Program) (string, [][]m
 	)
 
 	if len(p.Qualifications) == 0 {
-		sess.Step = stepReady
 		msg := header + "\n\nКвалификации в справочнике не указаны.\n\n" + h.formatRoles(p, "")
 		return msg, h.readyKeyboard(sess), p.Code
 	}
 	if len(p.Qualifications) == 1 {
-		sess.Qualification = p.Qualifications[0]
-		sess.Step = stepReady
 		msg := header + "\nКвалификация: " + sess.Qualification + "\n\n" + h.formatRoles(p, sess.Qualification)
 		return msg, h.readyKeyboard(sess), p.Code
 	}
 
-	sess.Step = stepAwaitQual
 	var b strings.Builder
 	b.WriteString(header)
 	b.WriteString("\n\nШаг 3/3 — квалификация\n\nВ программе несколько квалификаций. Выбери одну:")
 	return b.String(), h.qualKeyboard(sess), p.Code
 }
 
-func (h *Handler) selectQualification(chatID int64, idx int) (string, [][]maxapi.Button, string) {
+func (h *Handler) selectQualification(chatID int64, programCode string, idx int) (string, [][]maxapi.Button, string) {
 	sess := h.sessions.get(chatID)
+	if sess.Step != stepAwaitQual || !strings.EqualFold(sess.ProgramCode, programCode) {
+		return staleSelectionMessage(sess)
+	}
 	p, ok := h.catalog.Get(sess.ProgramCode)
 	if !ok {
 		return "Сначала выбери программу СПО.", [][]maxapi.Button{{maxapi.CallbackButton("🔄 Заново", payloadRestart)}}, "ошибка"
@@ -328,8 +376,13 @@ func (h *Handler) selectQualification(chatID int64, idx int) (string, [][]maxapi
 	if idx < 0 || idx >= len(p.Qualifications) {
 		return "Некорректная квалификация. Выбери кнопку из списка.", h.qualKeyboard(sess), "ошибка"
 	}
-	sess.Qualification = p.Qualifications[idx]
-	sess.Step = stepReady
+	sess, ok = h.sessions.updateIf(chatID, sess.Generation, stepAwaitQual, func(sess *session) {
+		sess.Qualification = p.Qualifications[idx]
+		sess.Step = stepReady
+	})
+	if !ok {
+		return staleSelectionMessage(h.sessions.get(chatID))
+	}
 	status := "актуальна"
 	if !p.IsCurrent {
 		status = "историческая / приём может быть закрыт"
@@ -372,28 +425,7 @@ func (h *Handler) formatRoles(p *catalog.Program, qualification string) string {
 	return b.String()
 }
 
-func (h *Handler) analyzeStub(chatID int64) (string, [][]maxapi.Button, string) {
-	sess := h.sessions.get(chatID)
-	if sess.Step != stepReady || sess.RegionCode == "" || sess.ProgramCode == "" {
-		return "Сначала заверши выбор направления (регион и программа СПО).", startKeyboardRows(), "не готово"
-	}
-	p, ok := h.catalog.Get(sess.ProgramCode)
-	if !ok {
-		return "Программа не найдена. Начни выбор заново.", startKeyboardRows(), "ошибка"
-	}
-	msg := fmt.Sprintf(
-		"Анализ рынка труда для «%s» в регионе «%s» скоро будет доступен.\n\n"+
-			"Выбор сохранён:\n• регион: %s\n• программа: %s — %s\n• квалификация: %s\n• поисковых запросов: %d\n\n"+
-			"На следующем этапе подключим вакансии «Работа России».",
-		p.ProgramName, sess.RegionName,
-		sess.RegionName, p.Code, p.ProgramName,
-		valueOrDash(sess.Qualification),
-		len(p.VacancyQueries),
-	)
-	return msg, h.readyKeyboard(sess), "анализ"
-}
-
-func (h *Handler) qualKeyboard(sess *session) [][]maxapi.Button {
+func (h *Handler) qualKeyboard(sess session) [][]maxapi.Button {
 	p, ok := h.catalog.Get(sess.ProgramCode)
 	if !ok {
 		return [][]maxapi.Button{{maxapi.CallbackButton("🔄 Заново", payloadRestart)}}
@@ -401,16 +433,16 @@ func (h *Handler) qualKeyboard(sess *session) [][]maxapi.Button {
 	rows := make([][]maxapi.Button, 0, len(p.Qualifications)+1)
 	for i, q := range p.Qualifications {
 		rows = append(rows, []maxapi.Button{
-			maxapi.CallbackButton(truncate(q, maxButtonLabel), fmt.Sprintf("%s%d", payloadQualPref, i)),
+			maxapi.CallbackButton(truncate(q, maxButtonLabel), fmt.Sprintf("%s%s:%d", payloadQualPref, p.Code, i)),
 		})
 	}
 	rows = append(rows, []maxapi.Button{maxapi.CallbackButton("🔄 Заново", payloadRestart)})
 	return rows
 }
 
-func (h *Handler) readyKeyboard(sess *session) [][]maxapi.Button {
+func (h *Handler) readyKeyboard(sess session) [][]maxapi.Button {
 	rows := [][]maxapi.Button{
-		{maxapi.CallbackButton("📊 Запустить анализ", payloadAnalyze)},
+		{maxapi.CallbackButton("📊 Запустить анализ", fmt.Sprintf("%s%d:%s", payloadAnalyze, sess.Generation, sess.ProgramCode))},
 		{maxapi.CallbackButton("🔄 Выбрать заново", payloadRestart)},
 	}
 	if p, ok := h.catalog.Get(sess.ProgramCode); ok {
@@ -492,4 +524,54 @@ func isCommand(text, name string) bool {
 	cmd := strings.SplitN(t[1:], "@", 2)[0]
 	cmd = strings.SplitN(cmd, " ", 2)[0]
 	return strings.EqualFold(cmd, name)
+}
+
+func parseQualificationPayload(value string) (string, int, bool) {
+	programCode, indexText, ok := strings.Cut(value, ":")
+	if !ok || strings.TrimSpace(programCode) == "" {
+		return "", 0, false
+	}
+	index, err := strconv.Atoi(indexText)
+	if err != nil || index < 0 {
+		return "", 0, false
+	}
+	return programCode, index, true
+}
+
+func parseAnalyzePayload(value string) (uint64, string, bool) {
+	generationText, programCode, ok := strings.Cut(value, ":")
+	if !ok || strings.TrimSpace(programCode) == "" {
+		return 0, "", false
+	}
+	generation, err := strconv.ParseUint(generationText, 10, 64)
+	if err != nil {
+		return 0, "", false
+	}
+	return generation, programCode, true
+}
+
+func containsFold(values []string, target string) bool {
+	for _, value := range values {
+		if strings.EqualFold(strings.TrimSpace(value), strings.TrimSpace(target)) {
+			return true
+		}
+	}
+	return false
+}
+
+func staleSelectionMessage(sess session) (string, [][]maxapi.Button, string) {
+	switch sess.Step {
+	case stepAwaitRegion:
+		return "Эта кнопка уже устарела. Выбери регион из последнего сообщения.", regionKeyboardRows(), "устарело"
+	case stepAwaitProgram:
+		return "Эта кнопка уже устарела. Напиши код или название программы ещё раз.", [][]maxapi.Button{{maxapi.CallbackButton("🔄 Заново", payloadRestart)}}, "устарело"
+	case stepAwaitQual:
+		return "Эта кнопка уже устарела. Выбери квалификацию из последнего сообщения.", nil, "устарело"
+	case stepReady:
+		return "Направление уже выбрано. Запусти анализ или начни заново.", nil, "устарело"
+	case stepAnalyzing:
+		return "Анализ уже выполняется. Дождись статистики и PDF либо начни выбор заново.", nil, "анализ идёт"
+	default:
+		return "Эта кнопка уже устарела. Начни выбор заново.", startKeyboardRows(), "устарело"
+	}
 }

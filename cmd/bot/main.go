@@ -5,6 +5,8 @@ import (
 	"Max-hack/internal/catalog"
 	"Max-hack/internal/handler"
 	"Max-hack/internal/maxapi"
+	"Max-hack/internal/pdfreport"
+	"Max-hack/internal/vacancies"
 	"Max-hack/internal/worker"
 	"context"
 	"errors"
@@ -12,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -67,7 +70,31 @@ func main() {
 	slog.Info("SPO catalog loaded", "programs", spoCatalog.Len(), "path", catalogPath)
 
 	maxClient := maxapi.NewClient(botToken)
-	botHandler := bot.NewHandler(maxClient, spoCatalog)
+	vacancyClient, err := vacancies.NewClient(vacancies.ClientConfig{
+		BaseURL:           envString("TRUDVSEM_BASE_URL", vacancies.DefaultBaseURL),
+		RequestTimeout:    envDuration("TRUDVSEM_REQUEST_TIMEOUT", 25*time.Second),
+		MaxResponseBytes:  int64(envInt("TRUDVSEM_MAX_RESPONSE_BYTES", 8<<20, 1<<20, 64<<20)),
+		RequestsPerSecond: float64(envInt("TRUDVSEM_REQUESTS_PER_SECOND", 3, 1, 10)),
+		MaxPagesPerQuery:  envInt("TRUDVSEM_MAX_PAGES_PER_QUERY", 2, 1, 10),
+	})
+	if err != nil {
+		slog.Error("Failed to configure Работа России client", "error", err)
+		os.Exit(1)
+	}
+	vacancyService := vacancies.NewService(vacancyClient, vacancies.ServiceOptions{
+		MaxQueries:       envInt("SKILLGAP_MAX_QUERIES", 6, 1, 20),
+		QueryConcurrency: envInt("SKILLGAP_QUERY_CONCURRENCY", 3, 1, 8),
+		PerQueryLimit:    envInt("SKILLGAP_PER_QUERY_LIMIT", 100, 1, 100),
+		MaxVacancies:     envInt("SKILLGAP_MAX_VACANCIES", 50, 1, 200),
+	})
+	reportGenerator := pdfreport.New(pdfreport.Config{
+		MaxVacancies: envInt("SKILLGAP_PDF_MAX_VACANCIES", 15, 1, 30),
+	})
+	botHandler := bot.NewHandler(maxClient, spoCatalog, vacancyService, reportGenerator, bot.AnalysisConfig{
+		Workers: envInt("SKILLGAP_ANALYSIS_WORKERS", 4, 1, 16),
+		Queue:   envInt("SKILLGAP_ANALYSIS_QUEUE", 100, 1, 1000),
+		Timeout: envDuration("SKILLGAP_ANALYSIS_TIMEOUT", 75*time.Second),
+	})
 
 	startupCtx, cancelStartup := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancelStartup()
@@ -113,6 +140,8 @@ func main() {
 	}
 
 	workerCtx, cancelWorkers := context.WithCancel(context.Background())
+	analysisCtx, cancelAnalysis := context.WithCancel(context.Background())
+	botHandler.StartAnalysisWorkers(analysisCtx)
 	pool := worker.NewPool(30, 10000, db, botHandler)
 	pool.Start(workerCtx)
 
@@ -163,5 +192,50 @@ func main() {
 		slog.Warn("Workers did not stop in time")
 	}
 
+	cancelAnalysis()
+	analysisDone := make(chan struct{})
+	go func() {
+		botHandler.WaitAnalysisWorkers()
+		close(analysisDone)
+	}()
+	select {
+	case <-analysisDone:
+	case <-time.After(10 * time.Second):
+		slog.Warn("Analysis workers did not stop in time")
+	}
+
 	slog.Info("Server exited gracefully")
+}
+
+func envString(name, fallback string) string {
+	if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func envInt(name string, fallback, minValue, maxValue int) int {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < minValue || value > maxValue {
+		slog.Warn("Invalid integer environment value; using default", "name", name, "value", raw, "default", fallback)
+		return fallback
+	}
+	return value
+}
+
+func envDuration(name string, fallback time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	value, err := time.ParseDuration(raw)
+	if err != nil || value <= 0 {
+		slog.Warn("Invalid duration environment value; using default", "name", name, "value", raw, "default", fallback)
+		return fallback
+	}
+	return value
 }

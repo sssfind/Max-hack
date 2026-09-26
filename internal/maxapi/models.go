@@ -1,5 +1,7 @@
 package maxapi
 
+import "encoding/json"
+
 const (
 	UpdateBotAdded        = "bot_added"
 	UpdateBotStarted      = "bot_started"
@@ -124,6 +126,30 @@ type Button struct {
 
 type InlineKeyboardPayload struct {
 	Buttons [][]Button `json:"buttons"`
+}
+
+type UploadType string
+
+const UploadTypeFile UploadType = "file"
+
+// UploadEndpoint is the signed, absolute URL returned by POST /uploads.
+// Token is optional because file uploads receive their token only after the
+// multipart body has been uploaded to URL.
+type UploadEndpoint struct {
+	URL   string `json:"url"`
+	Token string `json:"token,omitempty"`
+}
+
+// FileUploadResult is returned by the external upload host after a file has
+// been accepted. FileID is intentionally opaque; only Token is needed when
+// attaching the file to a message.
+type FileUploadResult struct {
+	FileID json.RawMessage `json:"fileId,omitempty"`
+	Token  string          `json:"token"`
+}
+
+type UploadedInfo struct {
+	Token string `json:"token"`
 }
 
 type AttachmentRequest struct {
