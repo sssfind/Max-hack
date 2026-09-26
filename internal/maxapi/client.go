@@ -595,7 +595,7 @@ func guardedUploadTransport(
 	// A proxy or a custom TLS dialer could resolve the untrusted hostname after
 	// our check. Direct all upload connections through the guarded dialer.
 	transport.Proxy = nil
-	transport.DialTLS = nil
+	transport.DialTLS = nil //nolint:staticcheck // The deprecated hook must be cleared so it cannot bypass the guarded DialContext.
 	transport.DialTLSContext = nil
 	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(address)

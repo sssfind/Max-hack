@@ -501,13 +501,6 @@ func helpText() string {
 		"Сценарий:\n1) регион\n2) программа СПО (код или название)\n3) квалификация (если их несколько)\n4) список возможных должностей и запуск анализа рынка"
 }
 
-func valueOrDash(s string) string {
-	if strings.TrimSpace(s) == "" {
-		return "—"
-	}
-	return s
-}
-
 func truncate(s string, max int) string {
 	if max <= 1 || utf8.RuneCountInString(s) <= max {
 		return s

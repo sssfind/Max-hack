@@ -76,15 +76,6 @@ func (s *sessionStore) set(chatID int64, sess session) session {
 	return cloneSession(sess)
 }
 
-func (s *sessionStore) update(chatID int64, update func(*session)) session {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	sess := cloneSession(s.byChat[chatID])
-	update(&sess)
-	s.byChat[chatID] = cloneSession(sess)
-	return cloneSession(sess)
-}
-
 // updateIf atomically applies a state transition only to the session snapshot
 // that produced the current message or keyboard. This prevents late webhook
 // workers and stale buttons from overwriting a newer user choice.
