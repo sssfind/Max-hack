@@ -438,18 +438,10 @@ func (h *Handler) qualKeyboard(sess session) [][]maxapi.Button {
 }
 
 func (h *Handler) readyKeyboard(sess session) [][]maxapi.Button {
-	rows := [][]maxapi.Button{
+	return [][]maxapi.Button{
 		{maxapi.CallbackButton("📊 Запустить анализ", fmt.Sprintf("%s%d:%s", payloadAnalyze, sess.Generation, sess.ProgramCode))},
 		{restartButton()},
 	}
-	if p, ok := h.catalog.Get(sess.ProgramCode); ok {
-		if url := p.SourceURL(); url != "" {
-			rows = append([][]maxapi.Button{
-				{maxapi.LinkButton("📄 Источник программы", url)},
-			}, rows...)
-		}
-	}
-	return rows
 }
 
 func (h *Handler) send(ctx context.Context, chatID, userID int64, text string, rows [][]maxapi.Button) error {

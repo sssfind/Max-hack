@@ -75,6 +75,22 @@ func TestBeginCallbackIncludesRestartButton(t *testing.T) {
 	assertRestartMessage(t, *answer.req.Message)
 }
 
+func TestReadyKeyboardDoesNotShowProgramSourceButton(t *testing.T) {
+	h := NewHandler(newFakeMessenger(), loadTestCatalog(t), nil, nil, AnalysisConfig{})
+	rows := h.readyKeyboard(session{Generation: 2, ProgramCode: "09.02.07"})
+
+	for _, row := range rows {
+		for _, button := range row {
+			if button.Text == "📄 Источник программы" || button.Type == "link" {
+				t.Fatalf("ready keyboard still contains program source button: %#v", rows)
+			}
+		}
+	}
+	if !hasCallbackPrefix(rows, payloadAnalyze) || !hasCallback(rows, payloadRestart) {
+		t.Fatalf("ready keyboard lost required actions: %#v", rows)
+	}
+}
+
 func assertRestartMessage(t *testing.T, body maxapi.NewMessageBody) {
 	t.Helper()
 	buttons := inlineKeyboardButtons(body)
