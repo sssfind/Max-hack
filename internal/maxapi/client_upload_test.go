@@ -123,10 +123,8 @@ func TestSendFileUploadsMultipartAndRetriesAttachmentNotReady(t *testing.T) {
 			var body struct {
 				Text        string `json:"text"`
 				Attachments []struct {
-					Type    string `json:"type"`
-					Payload struct {
-						Token string `json:"token"`
-					} `json:"payload"`
+					Type    string          `json:"type"`
+					Payload json.RawMessage `json:"payload"`
 				} `json:"attachments"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -135,8 +133,20 @@ func TestSendFileUploadsMultipartAndRetriesAttachmentNotReady(t *testing.T) {
 			if body.Text != "Отчёт готов" {
 				t.Errorf("message text = %q", body.Text)
 			}
-			if len(body.Attachments) != 1 || body.Attachments[0].Type != "file" || body.Attachments[0].Payload.Token != fileToken {
+			if len(body.Attachments) != 2 || body.Attachments[0].Type != "file" || body.Attachments[1].Type != "inline_keyboard" {
 				t.Errorf("unexpected message attachment: %+v", body.Attachments)
+			} else {
+				var file UploadedInfo
+				if err := json.Unmarshal(body.Attachments[0].Payload, &file); err != nil || file.Token != fileToken {
+					t.Errorf("unexpected file payload: %+v, err=%v", file, err)
+				}
+				var keyboard InlineKeyboardPayload
+				if err := json.Unmarshal(body.Attachments[1].Payload, &keyboard); err != nil {
+					t.Errorf("decode keyboard payload: %v", err)
+				} else if len(keyboard.Buttons) != 1 || len(keyboard.Buttons[0]) != 1 ||
+					keyboard.Buttons[0][0].Type != "callback" || keyboard.Buttons[0][0].Payload != "sg:restart" {
+					t.Errorf("unexpected keyboard payload: %+v", keyboard)
+				}
 			}
 
 			if attempt == 1 {
@@ -161,7 +171,8 @@ func TestSendFileUploadsMultipartAndRetriesAttachmentNotReady(t *testing.T) {
 		return nil
 	}
 
-	err := client.SendFile(context.Background(), chatID, 0, `reports\skillgap.pdf`, fileData, "Отчёт готов")
+	restart := []Button{CallbackButton("🔄 Начать заново", "sg:restart")}
+	err := client.SendFile(context.Background(), chatID, 0, `reports\skillgap.pdf`, fileData, "Отчёт готов", restart)
 	if err != nil {
 		t.Fatalf("SendFile() error = %v", err)
 	}

@@ -28,10 +28,11 @@ type recordedMessage struct {
 }
 
 type recordedFile struct {
-	chatID  int64
-	name    string
-	data    []byte
-	caption string
+	chatID   int64
+	name     string
+	data     []byte
+	caption  string
+	keyboard [][]maxapi.Button
 }
 
 type fakeMessenger struct {
@@ -56,8 +57,11 @@ func (m *fakeMessenger) AnswerCallback(_ context.Context, callbackID string, cha
 	return nil
 }
 
-func (m *fakeMessenger) SendFile(_ context.Context, chatID, _ int64, name string, data []byte, caption string) error {
-	m.files <- recordedFile{chatID: chatID, name: name, data: append([]byte(nil), data...), caption: caption}
+func (m *fakeMessenger) SendFile(_ context.Context, chatID, _ int64, name string, data []byte, caption string, keyboard ...[]maxapi.Button) error {
+	m.files <- recordedFile{
+		chatID: chatID, name: name, data: append([]byte(nil), data...), caption: caption,
+		keyboard: keyboard,
+	}
 	return nil
 }
 
@@ -140,6 +144,7 @@ func TestAnalyzeCallbackAcknowledgesImmediatelyAndSendsResults(t *testing.T) {
 	if answer.req.Message == nil || answer.req.Message.Text == nil || !strings.Contains(*answer.req.Message.Text, "Запустил анализ") {
 		t.Fatalf("unexpected callback answer: %#v", answer.req)
 	}
+	assertRestartMessage(t, *answer.req.Message)
 	receive(t, analyzer.started)
 	select {
 	case <-messenger.files:
@@ -152,9 +157,13 @@ func TestAnalyzeCallbackAcknowledgesImmediatelyAndSendsResults(t *testing.T) {
 	if message.body.Text == nil || !strings.Contains(*message.body.Text, "медианный ориентир") {
 		t.Fatalf("unexpected statistics message: %#v", message.body)
 	}
+	assertRestartMessage(t, message.body)
 	file := receive(t, messenger.files)
 	if file.name != "report.pdf" || string(file.data) != "%PDF-test" {
 		t.Fatalf("unexpected file: %#v", file)
+	}
+	if !hasCallback(file.keyboard, payloadRestart) {
+		t.Fatalf("PDF keyboard has no restart button: %#v", file.keyboard)
 	}
 	waitFor(t, func() bool { return h.sessions.get(42).Step == stepReady })
 }
@@ -227,6 +236,7 @@ func TestAnalyzeButtonCanBeReusedAfterFinish(t *testing.T) {
 		if message.body.Text == nil || !strings.Contains(*message.body.Text, "не найдено") {
 			t.Fatalf("unexpected analysis %s result: %#v", callbackID, message.body)
 		}
+		assertRestartMessage(t, message.body)
 		waitFor(t, func() bool { return h.sessions.get(17).Step == stepReady })
 	}
 
@@ -389,6 +399,7 @@ func TestAnalysisTimeoutStillNotifiesUser(t *testing.T) {
 	if message.body.Text == nil || !strings.Contains(*message.body.Text, "Не удалось получить вакансии") {
 		t.Fatalf("unexpected timeout message: %#v", message.body)
 	}
+	assertRestartMessage(t, message.body)
 	waitFor(t, func() bool { return h.sessions.get(55).Step == stepReady })
 }
 

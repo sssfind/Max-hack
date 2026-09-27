@@ -113,7 +113,7 @@ func (h *Handler) onMessage(ctx context.Context, update maxapi.Update) {
 	case stepAwaitProgram:
 		h.handleProgramText(ctx, chatID, userID, sess, text)
 	case stepAwaitQual:
-		_ = h.send(ctx, chatID, userID, "Выбери квалификацию кнопкой ниже или нажми «Заново».", h.qualKeyboard(sess))
+		_ = h.send(ctx, chatID, userID, "Выбери квалификацию кнопкой ниже или нажми «Начать заново».", h.qualKeyboard(sess))
 	case stepReady:
 		_ = h.send(ctx, chatID, userID, "Направление уже выбрано. Можно запустить анализ или начать заново.", h.readyKeyboard(sess))
 	case stepAnalyzing:
@@ -176,10 +176,7 @@ func (h *Handler) onCallback(ctx context.Context, update maxapi.Update) {
 		kb = startKeyboardRows()
 	}
 
-	message := maxapi.NewMessageBody{Text: &msgText}
-	if len(kb) > 0 {
-		message.Attachments = []maxapi.AttachmentRequest{maxapi.InlineKeyboard(kb...)}
-	}
+	message := messageWithRestart(msgText, kb)
 	answer := maxapi.SendAnswerRequest{Notification: &notify, Message: &message}
 	if err := h.api.AnswerCallback(ctx, update.Callback.CallbackID, chatID, answer); err != nil {
 		slog.Error("Failed to answer callback", "error", err, "callback_id", update.Callback.CallbackID)
@@ -229,14 +226,14 @@ func (h *Handler) handleRegionText(ctx context.Context, chatID, userID int64, se
 		_ = h.send(ctx, chatID, userID, "Выбор уже изменился. Используй кнопки из последнего сообщения.", startKeyboardRows())
 		return
 	}
-	rows = append(rows, []maxapi.Button{maxapi.CallbackButton("🔄 Заново", payloadRestart)})
+	rows = append(rows, restartKeyboardRows()...)
 	_ = h.send(ctx, chatID, userID, b.String(), rows)
 }
 
 func (h *Handler) selectRegion(chatID int64, short string) (string, [][]maxapi.Button, string) {
 	sess := h.sessions.get(chatID)
 	if sess.Step != stepAwaitRegion {
-		return staleSelectionMessage(sess)
+		return h.staleSelectionMessage(sess)
 	}
 	r, ok := catalog.RegionByShort(short)
 	if !ok {
@@ -256,13 +253,13 @@ func (h *Handler) applyRegion(chatID int64, generation uint64, r catalog.Region)
 		sess.SearchRegions = nil
 		sess.Step = stepAwaitProgram
 	}); !ok {
-		return staleSelectionMessage(h.sessions.get(chatID))
+		return h.staleSelectionMessage(h.sessions.get(chatID))
 	}
 	msg := fmt.Sprintf(
 		"Регион: %s\n\nШаг 2/3 — программа СПО\n\nНапиши код (например 09.02.07) или название программы / специальности.",
 		r.Name,
 	)
-	kb := [][]maxapi.Button{{maxapi.CallbackButton("🔄 Заново", payloadRestart)}}
+	kb := restartKeyboardRows()
 	return msg, kb, r.Name
 }
 
@@ -271,7 +268,7 @@ func (h *Handler) handleProgramText(ctx context.Context, chatID, userID int64, s
 	if len(hits) == 0 {
 		_ = h.send(ctx, chatID, userID,
 			"Программа не найдена. Уточни код или название (например «09.02.07» или «информационные системы»).",
-			[][]maxapi.Button{{maxapi.CallbackButton("🔄 Заново", payloadRestart)}},
+			restartKeyboardRows(),
 		)
 		return
 	}
@@ -303,19 +300,19 @@ func (h *Handler) handleProgramText(ctx context.Context, chatID, userID int64, s
 		_ = h.send(ctx, chatID, userID, "Выбор уже изменился. Используй кнопки из последнего сообщения.", startKeyboardRows())
 		return
 	}
-	rows = append(rows, []maxapi.Button{maxapi.CallbackButton("🔄 Заново", payloadRestart)})
+	rows = append(rows, restartKeyboardRows()...)
 	_ = h.send(ctx, chatID, userID, b.String(), rows)
 }
 
 func (h *Handler) selectProgram(chatID int64, code string) (string, [][]maxapi.Button, string) {
 	sess := h.sessions.get(chatID)
 	if sess.Step != stepAwaitProgram || !containsFold(sess.SearchPrograms, code) {
-		return staleSelectionMessage(sess)
+		return h.staleSelectionMessage(sess)
 	}
 	p, ok := h.catalog.Get(code)
 	if !ok {
 		return "Программа не найдена. Напиши код или название ещё раз.",
-			[][]maxapi.Button{{maxapi.CallbackButton("🔄 Заново", payloadRestart)}},
+			restartKeyboardRows(),
 			"ошибка"
 	}
 	return h.applyProgram(chatID, sess.Generation, p)
@@ -338,7 +335,7 @@ func (h *Handler) applyProgram(chatID int64, generation uint64, p *catalog.Progr
 		}
 	})
 	if !ok {
-		return staleSelectionMessage(h.sessions.get(chatID))
+		return h.staleSelectionMessage(h.sessions.get(chatID))
 	}
 	status := "актуальна"
 	if !p.IsCurrent {
@@ -367,11 +364,11 @@ func (h *Handler) applyProgram(chatID int64, generation uint64, p *catalog.Progr
 func (h *Handler) selectQualification(chatID int64, programCode string, idx int) (string, [][]maxapi.Button, string) {
 	sess := h.sessions.get(chatID)
 	if sess.Step != stepAwaitQual || !strings.EqualFold(sess.ProgramCode, programCode) {
-		return staleSelectionMessage(sess)
+		return h.staleSelectionMessage(sess)
 	}
 	p, ok := h.catalog.Get(sess.ProgramCode)
 	if !ok {
-		return "Сначала выбери программу СПО.", [][]maxapi.Button{{maxapi.CallbackButton("🔄 Заново", payloadRestart)}}, "ошибка"
+		return "Сначала выбери программу СПО.", restartKeyboardRows(), "ошибка"
 	}
 	if idx < 0 || idx >= len(p.Qualifications) {
 		return "Некорректная квалификация. Выбери кнопку из списка.", h.qualKeyboard(sess), "ошибка"
@@ -381,7 +378,7 @@ func (h *Handler) selectQualification(chatID int64, programCode string, idx int)
 		sess.Step = stepReady
 	})
 	if !ok {
-		return staleSelectionMessage(h.sessions.get(chatID))
+		return h.staleSelectionMessage(h.sessions.get(chatID))
 	}
 	status := "актуальна"
 	if !p.IsCurrent {
@@ -428,7 +425,7 @@ func (h *Handler) formatRoles(p *catalog.Program, qualification string) string {
 func (h *Handler) qualKeyboard(sess session) [][]maxapi.Button {
 	p, ok := h.catalog.Get(sess.ProgramCode)
 	if !ok {
-		return [][]maxapi.Button{{maxapi.CallbackButton("🔄 Заново", payloadRestart)}}
+		return restartKeyboardRows()
 	}
 	rows := make([][]maxapi.Button, 0, len(p.Qualifications)+1)
 	for i, q := range p.Qualifications {
@@ -436,14 +433,14 @@ func (h *Handler) qualKeyboard(sess session) [][]maxapi.Button {
 			maxapi.CallbackButton(truncate(q, maxButtonLabel), fmt.Sprintf("%s%s:%d", payloadQualPref, p.Code, i)),
 		})
 	}
-	rows = append(rows, []maxapi.Button{maxapi.CallbackButton("🔄 Заново", payloadRestart)})
+	rows = append(rows, restartKeyboardRows()...)
 	return rows
 }
 
 func (h *Handler) readyKeyboard(sess session) [][]maxapi.Button {
 	rows := [][]maxapi.Button{
 		{maxapi.CallbackButton("📊 Запустить анализ", fmt.Sprintf("%s%d:%s", payloadAnalyze, sess.Generation, sess.ProgramCode))},
-		{maxapi.CallbackButton("🔄 Выбрать заново", payloadRestart)},
+		{restartButton()},
 	}
 	if p, ok := h.catalog.Get(sess.ProgramCode); ok {
 		if url := p.SourceURL(); url != "" {
@@ -456,11 +453,38 @@ func (h *Handler) readyKeyboard(sess session) [][]maxapi.Button {
 }
 
 func (h *Handler) send(ctx context.Context, chatID, userID int64, text string, rows [][]maxapi.Button) error {
+	return h.api.SendMessage(ctx, chatID, userID, messageWithRestart(text, rows))
+}
+
+func messageWithRestart(text string, rows [][]maxapi.Button) maxapi.NewMessageBody {
+	rows = withRestartButton(rows)
 	body := maxapi.NewMessageBody{Text: &text}
 	if len(rows) > 0 {
 		body.Attachments = []maxapi.AttachmentRequest{maxapi.InlineKeyboard(rows...)}
 	}
-	return h.api.SendMessage(ctx, chatID, userID, body)
+	return body
+}
+
+func withRestartButton(rows [][]maxapi.Button) [][]maxapi.Button {
+	for _, row := range rows {
+		for _, button := range row {
+			if button.Type == "callback" && button.Payload == payloadRestart {
+				return rows
+			}
+		}
+	}
+
+	result := make([][]maxapi.Button, len(rows), len(rows)+1)
+	copy(result, rows)
+	return append(result, restartKeyboardRows()...)
+}
+
+func restartKeyboardRows() [][]maxapi.Button {
+	return [][]maxapi.Button{{restartButton()}}
+}
+
+func restartButton() maxapi.Button {
+	return maxapi.CallbackButton("🔄 Начать заново", payloadRestart)
 }
 
 func startKeyboard() [][]maxapi.Button {
@@ -471,6 +495,7 @@ func startKeyboardRows() [][]maxapi.Button {
 	return [][]maxapi.Button{
 		{maxapi.CallbackButton("🎯 Выбрать направление", payloadBegin)},
 		{maxapi.CallbackButton("❓ Справка", payloadHelp)},
+		{restartButton()},
 	}
 }
 
@@ -491,7 +516,7 @@ func regionKeyboardRows() [][]maxapi.Button {
 	if len(row) > 0 {
 		rows = append(rows, row)
 	}
-	rows = append(rows, []maxapi.Button{maxapi.CallbackButton("🔄 Заново", payloadRestart)})
+	rows = append(rows, restartKeyboardRows()...)
 	return rows
 }
 
@@ -552,18 +577,18 @@ func containsFold(values []string, target string) bool {
 	return false
 }
 
-func staleSelectionMessage(sess session) (string, [][]maxapi.Button, string) {
+func (h *Handler) staleSelectionMessage(sess session) (string, [][]maxapi.Button, string) {
 	switch sess.Step {
 	case stepAwaitRegion:
 		return "Эта кнопка уже устарела. Выбери регион из последнего сообщения.", regionKeyboardRows(), "устарело"
 	case stepAwaitProgram:
-		return "Эта кнопка уже устарела. Напиши код или название программы ещё раз.", [][]maxapi.Button{{maxapi.CallbackButton("🔄 Заново", payloadRestart)}}, "устарело"
+		return "Эта кнопка уже устарела. Напиши код или название программы ещё раз.", restartKeyboardRows(), "устарело"
 	case stepAwaitQual:
-		return "Эта кнопка уже устарела. Выбери квалификацию из последнего сообщения.", nil, "устарело"
+		return "Эта кнопка уже устарела. Выбери квалификацию из последнего сообщения.", h.qualKeyboard(sess), "устарело"
 	case stepReady:
-		return "Направление уже выбрано. Запусти анализ или начни заново.", nil, "устарело"
+		return "Направление уже выбрано. Запусти анализ или начни заново.", h.readyKeyboard(sess), "устарело"
 	case stepAnalyzing:
-		return "Анализ уже выполняется. Дождись статистики и PDF либо начни выбор заново.", nil, "анализ идёт"
+		return "Анализ уже выполняется. Дождись статистики и PDF либо начни выбор заново.", restartKeyboardRows(), "анализ идёт"
 	default:
 		return "Эта кнопка уже устарела. Начни выбор заново.", startKeyboardRows(), "устарело"
 	}

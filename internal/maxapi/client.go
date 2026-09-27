@@ -368,10 +368,10 @@ func (c *Client) UploadFile(ctx context.Context, filename string, data []byte) (
 	return token, nil
 }
 
-// SendFile uploads a file and sends it as a message. MAX may acknowledge the
-// upload before attachment processing is complete; only that explicit error is
-// retried, with a short exponential backoff.
-func (c *Client) SendFile(ctx context.Context, chatID, userID int64, filename string, data []byte, caption string) error {
+// SendFile uploads a file and sends it as a message, optionally with an inline
+// keyboard. MAX may acknowledge the upload before attachment processing is
+// complete; only that explicit error is retried, with a short exponential backoff.
+func (c *Client) SendFile(ctx context.Context, chatID, userID int64, filename string, data []byte, caption string, keyboard ...[]Button) error {
 	if chatID == 0 && userID == 0 {
 		return fmt.Errorf("send file: either chat_id or user_id is required")
 	}
@@ -383,6 +383,9 @@ func (c *Client) SendFile(ctx context.Context, chatID, userID int64, filename st
 
 	body := NewMessageBody{
 		Attachments: []AttachmentRequest{FileAttachment(token)},
+	}
+	if len(keyboard) > 0 {
+		body.Attachments = append(body.Attachments, InlineKeyboard(keyboard...))
 	}
 	if caption != "" {
 		body.Text = Ptr(caption)

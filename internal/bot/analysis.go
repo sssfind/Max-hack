@@ -19,7 +19,7 @@ import (
 type messenger interface {
 	SendMessage(context.Context, int64, int64, maxapi.NewMessageBody) error
 	AnswerCallback(context.Context, string, int64, maxapi.SendAnswerRequest) error
-	SendFile(context.Context, int64, int64, string, []byte, string) error
+	SendFile(context.Context, int64, int64, string, []byte, string, ...[]maxapi.Button) error
 }
 
 type marketAnalyzer interface {
@@ -167,7 +167,7 @@ func (h *Handler) answerAnalysisCallback(ctx context.Context, update maxapi.Upda
 	if update.Callback == nil {
 		return
 	}
-	body := maxapi.NewMessageBody{Text: &text}
+	body := messageWithRestart(text, nil)
 	req := maxapi.SendAnswerRequest{Message: &body, Notification: &notification}
 	if err := h.api.AnswerCallback(ctx, update.Callback.CallbackID, update.ResolvedChatID(), req); err != nil {
 		slog.Error("Failed to acknowledge analysis callback", "error", err)
@@ -221,7 +221,7 @@ func (r *analysisRunner) run(lifecycleCtx, jobCtx context.Context, job analysisJ
 				"Срез: %s, режим: %s. Попробуй позже или выбери другое направление.",
 			job.program.Code, job.selection.RegionName, snapshot.FetchedAt.Format("02.01.2006 15:04"), snapshot.Mode,
 		)
-		if err := r.api.SendMessage(lifecycleCtx, job.chatID, job.userID, maxapi.NewMessageBody{Text: &text}); err != nil {
+		if err := r.api.SendMessage(lifecycleCtx, job.chatID, job.userID, messageWithRestart(text, nil)); err != nil {
 			r.sendFailure(lifecycleCtx, job, "Не удалось отправить результат анализа. Попробуй повторить его позже.")
 		}
 		return
@@ -231,7 +231,7 @@ func (r *analysisRunner) run(lifecycleCtx, jobCtx context.Context, job analysisJ
 		return
 	}
 	statisticsText := formatStatistics(job, snapshot, stats)
-	if err := r.api.SendMessage(lifecycleCtx, job.chatID, job.userID, maxapi.NewMessageBody{Text: &statisticsText}); err != nil {
+	if err := r.api.SendMessage(lifecycleCtx, job.chatID, job.userID, messageWithRestart(statisticsText, nil)); err != nil {
 		slog.Error("Failed to send vacancy statistics", "error", err, "program_code", job.selection.ProgramCode)
 		r.sendFailure(lifecycleCtx, job, "Статистика готова, но отправить её не получилось. Запусти анализ ещё раз позже.")
 		return
@@ -256,7 +256,7 @@ func (r *analysisRunner) run(lifecycleCtx, jobCtx context.Context, job analysisJ
 		return
 	}
 	caption := "PDF с подходящими вакансиями и требованиями работодателей"
-	if err := r.api.SendFile(lifecycleCtx, job.chatID, job.userID, document.Filename, document.Data, caption); err != nil {
+	if err := r.api.SendFile(lifecycleCtx, job.chatID, job.userID, document.Filename, document.Data, caption, restartKeyboardRows()...); err != nil {
 		slog.Error("Failed to upload vacancy PDF", "error", err, "program_code", job.selection.ProgramCode)
 		r.sendFailure(lifecycleCtx, job, "Статистика готова, но отправить PDF не получилось. Запусти анализ ещё раз позже.")
 	}
@@ -266,7 +266,7 @@ func (r *analysisRunner) sendFailure(ctx context.Context, job analysisJob, text 
 	if ctx.Err() != nil || !r.sessions.isCurrentAnalysis(job.chatID, job.selection.Generation, job.selection.AnalysisID) {
 		return
 	}
-	_ = r.api.SendMessage(ctx, job.chatID, job.userID, maxapi.NewMessageBody{Text: &text})
+	_ = r.api.SendMessage(ctx, job.chatID, job.userID, messageWithRestart(text, nil))
 }
 
 func vacancyQueries(program *catalog.Program, qualification string) []string {
