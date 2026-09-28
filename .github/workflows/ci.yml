@@ -79,6 +79,9 @@ jobs:
       - name: Test with race detector
         run: task test-race
 
+      - name: Test production PDF parser limits
+        run: go test -count=1 ./internal/skillgap -run '^TestPDFDecompressionBombIsContainedByWorker$'
+
       - name: Check coverage floor
         shell: bash
         run: |

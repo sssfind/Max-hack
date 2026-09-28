@@ -179,6 +179,13 @@ func TestAnalyzePDFProvidesPageEvidence(t *testing.T) {
 	}
 }
 
+func TestPDFCoverageInstrumentationDetected(t *testing.T) {
+	want := testing.CoverMode() != ""
+	if got := pdfCoverageEnabled(); got != want {
+		t.Fatalf("pdfCoverageEnabled() = %v, want %v for cover mode %q", got, want, testing.CoverMode())
+	}
+}
+
 func TestPDFPageLimit(t *testing.T) {
 	t.Parallel()
 	payload := makePDF(t, "one", "two")
@@ -210,8 +217,8 @@ func TestHighlyCompressiblePDFStreamHonorsTextLimit(t *testing.T) {
 }
 
 func TestPDFDecompressionBombIsContainedByWorker(t *testing.T) {
-	if runtime.GOOS != "linux" || pdfRaceEnabled {
-		t.Skip("hard RLIMIT_AS regression applies to non-race Linux production builds")
+	if runtime.GOOS != "linux" || pdfRaceEnabled || pdfCoverageEnabled() {
+		t.Skip("hard RLIMIT_AS regression applies to plain Linux production builds")
 	}
 
 	options := Options{

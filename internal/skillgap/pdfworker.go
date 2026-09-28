@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -154,7 +155,7 @@ func parsePDFIsolated(ctx context.Context, payload []byte, fileName string, opts
 }
 
 func newPDFWorkerCommand(ctx context.Context, executable string, memoryLimit int64, timeout time.Duration) *exec.Cmd {
-	if runtime.GOOS != "linux" || pdfRaceEnabled {
+	if runtime.GOOS != "linux" || pdfRaceEnabled || pdfCoverageEnabled() {
 		return exec.CommandContext(ctx, executable)
 	}
 
@@ -166,6 +167,19 @@ func newPDFWorkerCommand(ctx context.Context, executable string, memoryLimit int
 	cpuSeconds := strconv.FormatInt(maxInt64(1, (timeout.Milliseconds()+999)/1000), 10)
 	const script = `ulimit -v "$1" && ulimit -t "$2" && exec "$3"`
 	return exec.CommandContext(ctx, "/bin/sh", "-c", script, "skillgap-pdf-worker", memoryKB, cpuSeconds, executable)
+}
+
+func pdfCoverageEnabled() bool {
+	buildInfo, ok := debug.ReadBuildInfo()
+	if !ok {
+		return false
+	}
+	for _, setting := range buildInfo.Settings {
+		if setting.Key == "-cover" && setting.Value == "true" {
+			return true
+		}
+	}
+	return false
 }
 
 func pdfWorkerEnvironment(memoryLimit int64) []string {
