@@ -1,0 +1,27 @@
+# Include this file inside the existing HTTPS server block for the bot domain.
+# The application itself listens only on 127.0.0.1:8080 on the host.
+
+client_max_body_size 1m;
+
+location = /webhook {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_connect_timeout 3s;
+    proxy_read_timeout 10s;
+}
+
+# Health and metrics stay private. Local monitoring and the deploy smoke test
+# access the application directly on 127.0.0.1:8080.
+location ~ ^/(metrics|healthz|readyz)$ {
+    allow 127.0.0.1;
+    allow ::1;
+    deny all;
+    proxy_pass http://127.0.0.1:8080;
+}
+
+location / {
+    return 404;
+}

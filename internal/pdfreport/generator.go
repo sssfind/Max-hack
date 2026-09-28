@@ -14,6 +14,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"Max-hack/internal/skillgap"
 	"Max-hack/internal/vacancies"
 
 	"github.com/go-pdf/fpdf"
@@ -59,6 +60,8 @@ type Input struct {
 	Roles         []string
 	Snapshot      vacancies.Snapshot
 	Statistics    vacancies.Statistics
+	SkillGap      *skillgap.Result
+	SkillGapNote  string
 	GeneratedAt   time.Time
 }
 
@@ -233,6 +236,7 @@ func renderOverview(pdf *fpdf.Fpdf, in Input, generatedAt time.Time, vacancyLimi
 	drawMetrics(pdf, in)
 	drawSalarySummary(pdf, in.Statistics)
 	drawTopSkills(pdf, in.Statistics.TopSkills)
+	drawSkillGap(pdf, in.SkillGap, in.SkillGapNote)
 	drawRoles(pdf, in.Roles)
 	drawDataNotes(pdf, in)
 
@@ -250,8 +254,8 @@ func drawSelectionBlock(pdf *fpdf.Fpdf, in Input, generatedAt time.Time) {
 	lines := []string{
 		"Регион: " + cleanText(in.RegionName),
 		"Квалификация: " + valueOrNoData(in.Qualification),
-		"Дата формирования: " + generatedAt.Format("02.01.2006 15:04"),
-		"Режим данных: " + valueOrNoData(string(in.Snapshot.Mode)),
+		"Дата формирования: " + generatedAt.Format("02.01.2006 15:04 MST"),
+		"Режим данных: " + modeLabel(in.Snapshot.Mode),
 	}
 	text := strings.Join(lines, "\n")
 	pdf.SetFillColor(241, 246, 251)
@@ -265,6 +269,19 @@ func drawSelectionBlock(pdf *fpdf.Fpdf, in Input, generatedAt time.Time) {
 	pdf.SetTextColor(28, 47, 68)
 	pdf.MultiCell(innerWidth, 4.4, text, "", "L", false)
 	pdf.SetY(y + height + 4)
+}
+
+func modeLabel(mode vacancies.Mode) string {
+	switch mode {
+	case vacancies.ModeLive:
+		return "live — данные получены от источника сейчас"
+	case vacancies.ModeCache:
+		return "cache — последний успешный срез"
+	case vacancies.ModeTest:
+		return "test — тестовые данные"
+	default:
+		return valueOrNoData(string(mode))
+	}
 }
 
 type metric struct {
@@ -287,7 +304,9 @@ func drawMetrics(pdf *fpdf.Fpdf, in Input) {
 		{fmt.Sprintf("%d", employerCount), "работодателей"},
 		{fmt.Sprintf("%d", stats.SalaryCount), "зарплатных наблюдений"},
 		{fmt.Sprintf("%d%%", stats.SalaryCoveragePercent), "с опубликованной зарплатой"},
-		{fmt.Sprintf("%d%%", stats.EntryLevelPercent), "без опыта или до 1 года"},
+		{fmt.Sprintf("%d%%", stats.NoExperiencePercent), "явно без опыта"},
+		{fmt.Sprintf("%d%%", stats.ExperienceUnknownPercent), "опыт не указан"},
+		{fmt.Sprintf("%d%%", stats.EntryLevelPercent), "явно без опыта или до 1 года"},
 		{fmt.Sprintf("%d%%", stats.RemotePercent), "с удалённым форматом"},
 	}
 
@@ -323,7 +342,7 @@ func drawSalarySummary(pdf *fpdf.Fpdf, stats vacancies.Statistics) {
 	pdf.CellFormat(0, 5, "Ориентир по опубликованным зарплатам", "", 1, "L", false, 0, "")
 	pdf.SetFont(fontFamily, "", 9)
 	pdf.SetTextColor(51, 65, 85)
-	text := "Нет данных: работодатели в текущей выборке не указали зарплату."
+	text := "Нет данных: работодатели в текущей выборке не указали зарплату и валюту."
 	if stats.SalaryCount > 0 && stats.SalaryMedian != nil {
 		sampleCount := stats.SalarySampleCount
 		if sampleCount == 0 {
@@ -334,8 +353,16 @@ func drawSalarySummary(pdf *fpdf.Fpdf, stats vacancies.Statistics) {
 			parts = append(parts, "диапазон "+formatRange(stats.SalaryMin, stats.SalaryMax, stats.Currency))
 		}
 		text = fmt.Sprintf("%s; расчёт по %d вакансиям в одной валюте.", strings.Join(parts, ", "), sampleCount)
+	} else if knownSalaryCount := stats.SalaryCount - stats.SalaryUnknownCurrencyCount; knownSalaryCount > 0 {
+		text = fmt.Sprintf("Опубликованные суммы с указанной валютой есть в %d вакансиях, но агрегат скрыт: нужно минимум %d наблюдений в одной валюте.", knownSalaryCount, vacancies.MinimumSalarySample)
+	} else if stats.SalaryUnknownCurrencyCount > 0 {
+		text = fmt.Sprintf("В %d вакансиях указана сумма без валюты; такие значения не включены в расчёт.", stats.SalaryUnknownCurrencyCount)
 	}
 	pdf.MultiCell(0, 4.8, cleanText(text), "", "L", false)
+	if method := cleanText(stats.SalaryMethod); method != "" {
+		pdf.SetTextColor(71, 85, 105)
+		pdf.MultiCell(0, 4.2, "Методика: "+method, "", "L", false)
+	}
 	if stats.SmallSample {
 		pdf.SetTextColor(180, 83, 9)
 		pdf.MultiCell(0, 4.5, "Выборка мала: значения могут заметно меняться при обновлении вакансий.", "", "L", false)
@@ -372,6 +399,98 @@ func drawTopSkills(pdf *fpdf.Fpdf, skills []vacancies.SkillFrequency) {
 	}
 }
 
+func drawSkillGap(pdf *fpdf.Fpdf, result *skillgap.Result, note string) {
+	if result == nil && strings.TrimSpace(note) == "" {
+		return
+	}
+	ensureSpace(pdf, 28)
+	sectionTitle(pdf, "Skill Gap: навыки рынка и федеральная программа")
+	if result == nil {
+		pdf.SetTextColor(180, 83, 9)
+		pdf.SetFont(fontFamily, "", 8.8)
+		pdf.MultiCell(0, 4.5, "Сопоставление не выполнено: "+cleanText(note), "", "L", false)
+		pdf.Ln(2)
+		return
+	}
+
+	limit := min(len(result.Matches), 10)
+	for _, match := range result.Matches[:limit] {
+		ensureSpace(pdf, 17)
+		pdf.SetFont(fontFamily, "B", 9)
+		switch match.Status {
+		case skillgap.StatusFound:
+			pdf.SetTextColor(4, 120, 87)
+		case skillgap.StatusPartial:
+			pdf.SetTextColor(180, 83, 9)
+		default:
+			pdf.SetTextColor(100, 116, 139)
+		}
+		pdf.MultiCell(0, 4.8, cleanText(match.Skill+" — "+skillGapStatusLabel(match.Status)), "", "L", false)
+		if len(match.Evidence) == 0 || match.Status == skillgap.StatusNotFound {
+			continue
+		}
+		evidence := match.Evidence[0]
+		location := skillGapEvidenceLocation(evidence)
+		text := ""
+		if location != "" {
+			text = location + ": "
+		}
+		text += "«" + truncate(cleanText(evidence.Excerpt), 360) + "»"
+		pdf.SetFont(fontFamily, "", 8.2)
+		pdf.SetTextColor(71, 85, 105)
+		pdf.MultiCell(0, 4.2, text, "", "L", false)
+	}
+
+	ensureSpace(pdf, 22)
+	pdf.SetFont(fontFamily, "", 8.2)
+	pdf.SetTextColor(71, 85, 105)
+	document := "федеральный документ"
+	switch result.Source.Type {
+	case skillgap.DocumentPOP:
+		document = "федеральная примерная образовательная программа (ПОП)"
+	case skillgap.DocumentFGOS:
+		document = "ФГОС"
+	}
+	if result.UsedFallback {
+		document += "; ПОП не удалось использовать, использован резервный ФГОС"
+	}
+	pdf.MultiCell(0, 4.2, "Проанализирован: "+document+". Срез: "+result.Source.FetchedAt.Format("02.01.2006 15:04 MST")+". SHA-256: "+result.Source.SHA256+".", "", "L", false)
+	if result.Source.URL != "" {
+		pdf.SetFont(fontFamily, "B", 8.5)
+		pdf.SetTextColor(13, 116, 144)
+		pdf.CellFormat(0, 5, "Открыть проанализированный федеральный документ", "", 1, "L", false, 0, result.Source.URL)
+	}
+	pdf.SetFont(fontFamily, "", 8.2)
+	pdf.SetTextColor(100, 116, 139)
+	pdf.MultiCell(0, 4.2, "Статус «Не найдено» означает только отсутствие совпадения в анализируемом документе. Он не доказывает, что конкретный колледж не обучает навыку.", "", "L", false)
+	pdf.Ln(2)
+}
+
+func skillGapStatusLabel(status skillgap.MatchStatus) string {
+	switch status {
+	case skillgap.StatusFound:
+		return "Найдено"
+	case skillgap.StatusPartial:
+		return "Частично найдено"
+	default:
+		return "Не найдено в анализируемом документе"
+	}
+}
+
+func skillGapEvidenceLocation(evidence skillgap.Evidence) string {
+	parts := make([]string, 0, 3)
+	if section := cleanText(evidence.Section); section != "" {
+		parts = append(parts, section)
+	}
+	if file := cleanText(evidence.File); file != "" {
+		parts = append(parts, file)
+	}
+	if evidence.Page > 0 {
+		parts = append(parts, fmt.Sprintf("стр. %d", evidence.Page))
+	}
+	return strings.Join(parts, ", ")
+}
+
 func drawRoles(pdf *fpdf.Fpdf, roles []string) {
 	roles = uniqueNonEmpty(roles, 8)
 	if len(roles) == 0 {
@@ -397,6 +516,9 @@ func drawDataNotes(pdf *fpdf.Fpdf, in Input) {
 	case vacancies.ModeCache:
 		text = "Использован кэшированный срез; дата получения указана ниже. " + text
 	}
+	if in.Snapshot.Partial {
+		text = "Срез неполный: часть запросов или страниц источника не была обработана. " + text
+	}
 	pdf.SetFillColor(255, 248, 230)
 	pdf.SetDrawColor(245, 194, 66)
 	y := pdf.GetY()
@@ -414,9 +536,23 @@ func drawDataNotes(pdf *fpdf.Fpdf, in Input) {
 		pdf.SetTextColor(71, 85, 105)
 		fetched := ""
 		if !in.Snapshot.FetchedAt.IsZero() {
-			fetched = ", срез от " + in.Snapshot.FetchedAt.Format("02.01.2006 15:04")
+			fetched = ", срез от " + in.Snapshot.FetchedAt.Format("02.01.2006 15:04 MST")
 		}
 		pdf.MultiCell(0, 4.2, "Источник данных: "+source+fetched+".", "", "L", false)
+	}
+	stages := in.Snapshot.Sampling
+	if stages.Retrieved > 0 || stages.SourceTotal > 0 {
+		pdf.SetTextColor(71, 85, 105)
+		sourceTotal := "не сообщил"
+		if stages.SourceTotal > 0 {
+			sourceTotal = fmt.Sprintf("%d", stages.SourceTotal)
+		}
+		pipeline := fmt.Sprintf(
+			"Этапы выборки: сумма выдач источника до удаления повторов — %s; получено %d; прошли фильтр стартового уровня %d (из них опыт не указан у %d); образования %d; релевантности %d; уникальных %d; включено %d.",
+			sourceTotal, stages.Retrieved, stages.EntryLevelPassed, stages.ExperienceUnknownPassed, stages.EducationPassed,
+			stages.RelevantPassed, stages.Deduplicated, stages.Included,
+		)
+		pdf.MultiCell(0, 4.2, pipeline, "", "L", false)
 	}
 	for _, warning := range uniqueNonEmpty(in.Snapshot.Warnings, 5) {
 		pdf.SetTextColor(180, 83, 9)
@@ -518,12 +654,22 @@ func vacancyCardData(v vacancies.Vacancy) cardData {
 	return cardData{
 		title:        truncate(valueOrNoData(v.Title), 180),
 		meta:         truncate(cleanText(strings.Join(metaParts, " | ")), 360),
-		salary:       formatRange(v.SalaryFrom, v.SalaryTo, v.Currency),
+		salary:       vacancySalary(v),
 		skills:       truncate(valueOrNoData(strings.Join(skills, ", ")), 420),
 		requirements: truncate(valueOrNoData(requirements), 900),
 		duties:       truncate(valueOrNoData(v.Duties), 800),
 		url:          safeVacancyURL(v.URL),
 	}
+}
+
+func vacancySalary(v vacancies.Vacancy) string {
+	if v.SalaryFrom != nil || v.SalaryTo != nil {
+		return formatRange(v.SalaryFrom, v.SalaryTo, v.Currency)
+	}
+	if text := cleanText(v.SalaryText); strings.ContainsFunc(text, unicode.IsDigit) {
+		return truncate(text, 180) + " (как указано работодателем; не включено в статистику)"
+	}
+	return "Нет данных"
 }
 
 func vacancyCardHeight(pdf *fpdf.Fpdf, card cardData, width float64) float64 {
@@ -663,7 +809,10 @@ func formatMoney(value int64, currency string) string {
 
 func currencyLabel(currency string) string {
 	normalized := strings.ToLower(cleanText(currency))
-	if normalized == "" || strings.Contains(normalized, "руб") || normalized == "rub" || normalized == "rur" {
+	if normalized == "" {
+		return "(валюта не указана)"
+	}
+	if strings.Contains(normalized, "руб") || normalized == "rub" || normalized == "rur" {
 		return "руб."
 	}
 	return cleanText(currency)
@@ -679,7 +828,10 @@ func sourceName(source string) string {
 func safeVacancyURL(raw string) string {
 	raw = strings.TrimSpace(raw)
 	parsed, err := url.ParseRequestURI(raw)
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil {
+		return ""
+	}
+	if port := parsed.Port(); port != "" && port != "443" {
 		return ""
 	}
 	host := strings.ToLower(parsed.Hostname())

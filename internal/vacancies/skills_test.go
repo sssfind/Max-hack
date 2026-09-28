@@ -1,6 +1,9 @@
 package vacancies
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestCollectSkillsDeduplicatesStructuredAndExtractedEvidence(t *testing.T) {
 	t.Parallel()
@@ -30,6 +33,12 @@ func TestCollectSkillsDeduplicatesStructuredAndExtractedEvidence(t *testing.T) {
 	if byName["Python"].Evidence != "из текста требований" {
 		t.Errorf("extracted evidence = %q", byName["Python"].Evidence)
 	}
+	if byName["Python"].EvidenceField != "requirements" || !strings.Contains(byName["Python"].EvidenceExcerpt, "Python") {
+		t.Errorf("exact Python evidence = %+v", byName["Python"])
+	}
+	if byName["SQL"].EvidenceField != "skills" || byName["SQL"].EvidenceExcerpt != "SQL" {
+		t.Errorf("structured SQL evidence = %+v", byName["SQL"])
+	}
 }
 
 func TestCollectSkillsRecognizesDomainPatterns(t *testing.T) {
@@ -37,7 +46,8 @@ func TestCollectSkillsRecognizesDomainPatterns(t *testing.T) {
 
 	text := "1С, Excel, PostgreSQL, JavaScript, C++, C#, golang, Kubernetes, HTML/CSS, AutoCAD, КОМПАС-3D, САПР, " +
 		"чтение чертежей, ЧПУ, сварочные работы, электробезопасность, охрана труда, " +
-		"бухучет, делопроизводство, продажи, работа с клиентами, коммуникабельность, ГОСТ"
+		"бухучет, делопроизводство, продажи, работа с клиентами, коммуникабельность, ГОСТ, " +
+		"электромонтажные работы, складской учет, первая помощь, санитарные нормы, Figma, CRM"
 	got := collectSkills(nil, text)
 	names := make(map[string]bool, len(got))
 	for _, skill := range got {
@@ -47,6 +57,7 @@ func TestCollectSkillsRecognizesDomainPatterns(t *testing.T) {
 		"1С", "Microsoft Excel", "SQL", "JavaScript", "C++", "C#", "Go", "Kubernetes", "HTML/CSS",
 		"AutoCAD", "КОМПАС-3D", "САПР", "Чтение чертежей", "Работа на станках с ЧПУ", "Сварочные работы",
 		"Электробезопасность", "Охрана труда", "Бухгалтерский учет", "Делопроизводство", "Продажи", "Работа с клиентами", "Коммуникация", "ГОСТ",
+		"Электромонтаж", "Складской учет", "Первая помощь", "Санитарные нормы", "Figma", "CRM",
 	}
 	for _, name := range want {
 		if !names[name] {
@@ -90,6 +101,18 @@ func TestMergeSkillsPreservesFirstEvidenceAndOrder(t *testing.T) {
 	}
 }
 
+func TestMergeSkillsPrefersStructuredEvidence(t *testing.T) {
+	t.Parallel()
+
+	got := mergeSkills(
+		[]Skill{{Name: "PostgreSQL", EvidenceField: "requirements", EvidenceExcerpt: "знание PostgreSQL"}},
+		[]Skill{{Name: "SQL", EvidenceField: "skills", EvidenceExcerpt: "SQL"}},
+	)
+	if len(got) != 1 || got[0].Name != "SQL" || got[0].EvidenceField != "skills" {
+		t.Fatalf("preferred evidence = %#v", got)
+	}
+}
+
 func TestTopSkillFrequenciesCountsOncePerVacancyAndLimits(t *testing.T) {
 	t.Parallel()
 
@@ -120,10 +143,33 @@ func TestTopSkillFrequenciesCountsOncePerVacancyAndLimits(t *testing.T) {
 func TestNormalizeSkillKey(t *testing.T) {
 	t.Parallel()
 
-	if got := normalizeSkillKey("  Microsoft   SQL\tServer "); got != "microsoft sql server" {
+	if got := normalizeSkillKey("  Microsoft   SQL\tServer "); got != "sql" {
 		t.Errorf("normalizeSkillKey = %q", got)
 	}
 	if got := normalizeSkillKey("   "); got != "" {
 		t.Errorf("normalizeSkillKey(blank) = %q", got)
+	}
+}
+
+func TestCollectSkillsNormalizesStructuredAliasesAndKeepsSourceField(t *testing.T) {
+	t.Parallel()
+
+	got := collectSkillsFromFields(
+		[]string{"PostgreSQL", "MS Excel", "golang"},
+		"",
+		"Требуется английский язык",
+		"Работа с Docker в команде",
+	)
+	byName := make(map[string]Skill, len(got))
+	for _, skill := range got {
+		byName[skill.Name] = skill
+	}
+	for _, name := range []string{"SQL", "Microsoft Excel", "Go", "Английский язык", "Docker"} {
+		if _, ok := byName[name]; !ok {
+			t.Errorf("missing canonical skill %q in %#v", name, got)
+		}
+	}
+	if byName["Английский язык"].EvidenceField != "requirements" || byName["Docker"].EvidenceField != "duties" {
+		t.Errorf("source fields = english:%+v docker:%+v", byName["Английский язык"], byName["Docker"])
 	}
 }

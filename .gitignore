@@ -1,5 +1,19 @@
 .env
-.idea
-.cursor
-.Техническое задание SkillGap 2.0.md
-.pdf
+.env.*
+!.env.example
+
+.idea/
+.cursor/
+.vscode/
+
+bin/
+.task/
+coverage/
+tmp/
+*.cover
+*.out
+*.log
+*.prof
+
+.DS_Store
+Thumbs.db

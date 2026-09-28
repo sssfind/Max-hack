@@ -4,13 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestClientSearchBuildsRequestAndNormalizesSchema(t *testing.T) {
@@ -114,6 +117,12 @@ func TestClientSearchBuildsRequestAndNormalizesSchema(t *testing.T) {
 	if got.Currency != "RUB" {
 		t.Errorf("Currency = %q", got.Currency)
 	}
+	if got.SalaryText != "от 50000" {
+		t.Errorf("SalaryText = %q", got.SalaryText)
+	}
+	if got.EducationClass != EducationSecondaryVocational {
+		t.Errorf("EducationClass = %q", got.EducationClass)
+	}
 	if got.URL != "https://trudvsem.ru/vacancy/card/company/vacancy-1" {
 		t.Errorf("URL = %q", got.URL)
 	}
@@ -169,6 +178,30 @@ func TestClientSearchHandlesEmptyResults(t *testing.T) {
 	}
 	if len(items) != 0 {
 		t.Fatalf("items = %#v, want empty", items)
+	}
+}
+
+func TestNormalizeVacancyURLRejectsDeceptiveLinks(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "official", raw: "https://trudvsem.ru/vacancy/1", want: "https://trudvsem.ru/vacancy/1"},
+		{name: "official subdomain", raw: "https://www.trudvsem.ru/vacancy/1", want: "https://www.trudvsem.ru/vacancy/1"},
+		{name: "userinfo", raw: "https://attacker@trudvsem.ru/vacancy/1"},
+		{name: "non-standard port", raw: "https://trudvsem.ru:444/vacancy/1"},
+		{name: "lookalike", raw: "https://trudvsem.ru.example.org/vacancy/1"},
+		{name: "insecure", raw: "http://trudvsem.ru/vacancy/1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizeVacancyURL(tt.raw); got != tt.want {
+				t.Fatalf("normalizeVacancyURL(%q) = %q, want %q", tt.raw, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -428,6 +461,11 @@ func TestNormalizeVacancyOptionalNumbersDatesAndCurrency(t *testing.T) {
 			raw:          apiVacancy{CreationDate: "not-a-date", Currency: "cad"},
 			wantCurrency: "CAD",
 		},
+		{
+			name:         "unknown currency label is not guessed",
+			raw:          apiVacancy{Currency: "не указано"},
+			wantCurrency: "",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -445,6 +483,54 @@ func TestNormalizeVacancyOptionalNumbersDatesAndCurrency(t *testing.T) {
 	}
 }
 
+func TestNormalizeVacancyRejectsInvertedSalaryRange(t *testing.T) {
+	t.Parallel()
+
+	raw := apiVacancy{SalaryText: "ошибочная вилка"}
+	raw.SalaryMin = flexibleInt64{Value: 100_000, Valid: true}
+	raw.SalaryMax = flexibleInt64{Value: 50_000, Valid: true}
+	got := normalizeVacancy(raw, "query")
+	if got.SalaryFrom != nil || got.SalaryTo != nil || got.SalaryText != "ошибочная вилка" {
+		t.Fatalf("inverted salary range = %+v", got)
+	}
+}
+
+func TestNormalizeVacancyBoundsUntrustedFieldsAndSkills(t *testing.T) {
+	t.Parallel()
+
+	raw := apiVacancy{
+		ID:           strings.Repeat("я", maxVacancyIDBytes),
+		Title:        strings.Repeat("я", maxVacancyTitleBytes),
+		Requirements: strings.Repeat("я", maxDescriptionBytes),
+	}
+	for i := 0; i < maxVacancySkills+50; i++ {
+		raw.Skills = append(raw.Skills, fmt.Sprintf("skill-%03d-%s", i, strings.Repeat("я", maxSkillNameBytes)))
+	}
+
+	got := normalizeVacancy(raw, strings.Repeat("я", maxQueryTextBytes))
+	for name, valueAndLimit := range map[string]struct {
+		value string
+		limit int
+	}{
+		"id":           {got.ID, maxVacancyIDBytes},
+		"title":        {got.Title, maxVacancyTitleBytes},
+		"requirements": {got.Requirements, maxDescriptionBytes},
+		"query":        {got.FoundByQuery, maxQueryTextBytes},
+	} {
+		if len(valueAndLimit.value) > valueAndLimit.limit || !utf8.ValidString(valueAndLimit.value) {
+			t.Errorf("%s has %d bytes (limit %d), valid UTF-8=%v", name, len(valueAndLimit.value), valueAndLimit.limit, utf8.ValidString(valueAndLimit.value))
+		}
+	}
+	if len(got.Skills) != maxVacancySkills {
+		t.Fatalf("skills = %d, want capped at %d", len(got.Skills), maxVacancySkills)
+	}
+	for _, skill := range got.Skills {
+		if len(skill.Name) > maxSkillNameBytes || !utf8.ValidString(skill.Name) {
+			t.Fatalf("unbounded or invalid skill name: %q", skill.Name)
+		}
+	}
+}
+
 func TestNewClientValidatesBaseURL(t *testing.T) {
 	t.Parallel()
 
@@ -457,6 +543,9 @@ func TestNewClientValidatesBaseURL(t *testing.T) {
 		{name: "https", baseURL: "https://example.test/api"},
 		{name: "localhost http", baseURL: "http://localhost:8080/api"},
 		{name: "loopback http", baseURL: "http://127.0.0.1:8080/api"},
+		{name: "credentials", baseURL: "https://user@example.test/api", wantErr: true},
+		{name: "query", baseURL: "https://example.test/api?source=other", wantErr: true},
+		{name: "fragment", baseURL: "https://example.test/api#other", wantErr: true},
 		{name: "remote http", baseURL: "http://example.test/api", wantErr: true},
 		{name: "missing scheme", baseURL: "example.test/api", wantErr: true},
 		{name: "malformed", baseURL: "://", wantErr: true},
@@ -469,6 +558,75 @@ func TestNewClientValidatesBaseURL(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestNewClientClassifiesOnlyExactOfficialEndpointAsLive(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		baseURL    string
+		wantMode   Mode
+		wantSource string
+	}{
+		{name: "default", wantMode: ModeLive, wantSource: officialSourceName},
+		{name: "explicit 443", baseURL: "https://opendata.trudvsem.ru:443/api/v1/vacancies/", wantMode: ModeLive, wantSource: officialSourceName},
+		{name: "other path", baseURL: "https://opendata.trudvsem.ru/api/v1/other", wantMode: ModeTest},
+		{name: "lookalike", baseURL: "https://opendata.trudvsem.ru.example.test/api/v1/vacancies", wantMode: ModeTest},
+		{name: "custom", baseURL: "https://example.test/vacancies", wantMode: ModeTest},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, err := NewClient(ClientConfig{BaseURL: tt.baseURL})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if client.mode != tt.wantMode {
+				t.Errorf("mode = %q, want %q", client.mode, tt.wantMode)
+			}
+			if tt.wantSource != "" && client.source != tt.wantSource {
+				t.Errorf("source = %q, want %q", client.source, tt.wantSource)
+			}
+			if tt.wantMode == ModeTest && (client.source == officialSourceName || !strings.Contains(client.source, "тестовый")) {
+				t.Errorf("custom source was branded as official: %q", client.source)
+			}
+		})
+	}
+}
+
+func TestNewClientKeepsRedirectsWithinConfiguredSource(t *testing.T) {
+	t.Parallel()
+
+	client, err := NewClient(ClientConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := []*http.Request{{URL: mustURL(t, DefaultBaseURL+"/region/77")}}
+	if err := client.httpClient.CheckRedirect(
+		&http.Request{URL: mustURL(t, DefaultBaseURL+"/region/77?page=2")}, previous,
+	); err != nil {
+		t.Fatalf("same-source redirect rejected: %v", err)
+	}
+
+	tests := []string{
+		"https://example.test/api/v1/vacancies/region/77",
+		"http://opendata.trudvsem.ru/api/v1/vacancies/region/77",
+		"https://opendata.trudvsem.ru/other",
+	}
+	for _, target := range tests {
+		if err := client.httpClient.CheckRedirect(&http.Request{URL: mustURL(t, target)}, previous); err == nil {
+			t.Errorf("unsafe redirect accepted: %s", target)
+		}
+	}
+}
+
+func mustURL(t *testing.T, raw string) *url.URL {
+	t.Helper()
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return parsed
 }
 
 func TestNewClientRejectsExcessivePageLimit(t *testing.T) {

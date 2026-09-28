@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/time/rate"
 )
@@ -22,7 +23,17 @@ const (
 	defaultMaxResponseSize = int64(8 << 20)
 	defaultRequestsPerSec  = 3.0
 	defaultMaxPages        = 2
+	maxVacancyIDBytes      = 256
+	maxVacancyTitleBytes   = 512
+	maxShortFieldBytes     = 512
+	maxDescriptionBytes    = 16 << 10
+	maxSalaryTextBytes     = 1024
+	maxQueryTextBytes      = 512
+	maxVacancySkills       = 100
+	maxSkillNameBytes      = 256
 )
+
+const officialSourceName = "Работа России (opendata.trudvsem.ru)"
 
 var htmlTagPattern = regexp.MustCompile(`(?s)<[^>]*>`)
 
@@ -37,6 +48,8 @@ type ClientConfig struct {
 
 type Client struct {
 	baseURL          string
+	source           string
+	mode             Mode
 	httpClient       *http.Client
 	requestTimeout   time.Duration
 	maxResponseBytes int64
@@ -53,9 +66,14 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return nil, fmt.Errorf("invalid vacancies base URL %q", baseURL)
 	}
-	if parsed.Scheme != "https" && parsed.Hostname() != "127.0.0.1" && parsed.Hostname() != "localhost" {
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return nil, fmt.Errorf("vacancies base URL must not contain credentials, query, or fragment")
+	}
+	hostname := strings.ToLower(parsed.Hostname())
+	if parsed.Scheme != "https" && hostname != "127.0.0.1" && hostname != "localhost" {
 		return nil, fmt.Errorf("vacancies base URL must use https")
 	}
+	source, mode := vacancySourceMetadata(parsed)
 
 	timeout := cfg.RequestTimeout
 	if timeout <= 0 {
@@ -68,6 +86,20 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: timeout}
+	}
+	clientCopy := *httpClient
+	previousRedirectCheck := clientCopy.CheckRedirect
+	clientCopy.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 3 {
+			return errors.New("vacancies request has too many redirects")
+		}
+		if !sameVacancySource(parsed, req.URL, mode) {
+			return fmt.Errorf("vacancies redirect leaves configured source: %s", req.URL.Redacted())
+		}
+		if previousRedirectCheck != nil {
+			return previousRedirectCheck(req, via)
+		}
+		return nil
 	}
 	requestsPerSecond := cfg.RequestsPerSecond
 	if requestsPerSecond <= 0 {
@@ -82,12 +114,61 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	}
 	return &Client{
 		baseURL:          baseURL,
-		httpClient:       httpClient,
+		source:           source,
+		mode:             mode,
+		httpClient:       &clientCopy,
 		requestTimeout:   timeout,
 		maxResponseBytes: maxBytes,
 		limiter:          rate.NewLimiter(rate.Limit(requestsPerSecond), 3),
 		maxPages:         maxPages,
 	}, nil
+}
+
+func sameVacancySource(base, target *url.URL, mode Mode) bool {
+	if base == nil || target == nil || target.User != nil {
+		return false
+	}
+	if !strings.EqualFold(base.Scheme, target.Scheme) ||
+		!strings.EqualFold(base.Hostname(), target.Hostname()) ||
+		effectivePort(base) != effectivePort(target) {
+		return false
+	}
+	if mode != ModeLive {
+		return true
+	}
+	path := target.EscapedPath()
+	return path == "/api/v1/vacancies" || strings.HasPrefix(path, "/api/v1/vacancies/")
+}
+
+func effectivePort(value *url.URL) string {
+	if value == nil {
+		return ""
+	}
+	if port := value.Port(); port != "" {
+		return port
+	}
+	if strings.EqualFold(value.Scheme, "https") {
+		return "443"
+	}
+	if strings.EqualFold(value.Scheme, "http") {
+		return "80"
+	}
+	return ""
+}
+
+func vacancySourceMetadata(parsed *url.URL) (string, Mode) {
+	if parsed != nil &&
+		parsed.Scheme == "https" &&
+		strings.EqualFold(parsed.Hostname(), "opendata.trudvsem.ru") &&
+		(parsed.Port() == "" || parsed.Port() == "443") &&
+		parsed.EscapedPath() == "/api/v1/vacancies" {
+		return officialSourceName, ModeLive
+	}
+	host := "unknown"
+	if parsed != nil && parsed.Host != "" {
+		host = parsed.Host
+	}
+	return fmt.Sprintf("Настраиваемый тестовый источник вакансий (%s)", host), ModeTest
 }
 
 type apiEnvelope struct {
@@ -367,22 +448,23 @@ func waitForRetry(ctx context.Context, delay time.Duration) error {
 
 func normalizeVacancy(raw apiVacancy, query string) Vacancy {
 	v := Vacancy{
-		ID:           strings.TrimSpace(raw.ID),
-		Title:        cleanText(raw.Title),
-		Employer:     cleanText(raw.Company.Name),
-		EmployerID:   strings.TrimSpace(raw.Company.CompanyCode),
-		Region:       cleanText(raw.Region.Name),
-		Duties:       cleanText(raw.Duties),
-		Requirements: cleanText(raw.Requirements),
-		Education:    cleanText(raw.Requirement.Education),
-		Employment:   cleanText(raw.Employment),
-		Schedule:     cleanText(raw.Schedule),
+		ID:           truncateUTF8Bytes(strings.TrimSpace(raw.ID), maxVacancyIDBytes),
+		Title:        cleanTextBounded(raw.Title, maxVacancyTitleBytes),
+		Employer:     cleanTextBounded(raw.Company.Name, maxShortFieldBytes),
+		EmployerID:   truncateUTF8Bytes(strings.TrimSpace(raw.Company.CompanyCode), maxVacancyIDBytes),
+		Region:       cleanTextBounded(raw.Region.Name, maxShortFieldBytes),
+		Duties:       cleanTextBounded(raw.Duties, maxDescriptionBytes),
+		Requirements: cleanTextBounded(raw.Requirements, maxDescriptionBytes),
+		Education:    cleanTextBounded(raw.Requirement.Education, maxShortFieldBytes),
+		Employment:   cleanTextBounded(raw.Employment, maxShortFieldBytes),
+		Schedule:     cleanTextBounded(raw.Schedule, maxShortFieldBytes),
 		Currency:     normalizeCurrency(raw.Currency),
+		SalaryText:   cleanTextBounded(raw.SalaryText, maxSalaryTextBytes),
 		URL:          normalizeVacancyURL(raw.URL),
-		FoundByQuery: strings.TrimSpace(query),
+		FoundByQuery: truncateUTF8Bytes(strings.TrimSpace(query), maxQueryTextBytes),
 	}
 	if len(raw.Addresses.Address) > 0 {
-		v.Location = cleanText(raw.Addresses.Address[0].Location)
+		v.Location = cleanTextBounded(raw.Addresses.Address[0].Location, maxShortFieldBytes)
 	}
 	if raw.Requirement.Experience.Valid {
 		experience := raw.Requirement.Experience.Value
@@ -396,14 +478,22 @@ func normalizeVacancy(raw apiVacancy, query string) Vacancy {
 		value := raw.SalaryMax.Value
 		v.SalaryTo = &value
 	}
+	if v.SalaryFrom != nil && v.SalaryTo != nil && *v.SalaryFrom > *v.SalaryTo {
+		v.SalaryFrom = nil
+		v.SalaryTo = nil
+	}
 	v.PublishedAt = parseAPITime(raw.CreationDate)
-	v.Skills = collectSkills(raw.Skills, strings.Join([]string{raw.Qualification, raw.Requirements, raw.Duties}, " "))
+	v.EducationClass = classifyEducation(v)
+	v.Skills = collectSkillsFromFields(raw.Skills, raw.Qualification, raw.Requirements, raw.Duties)
 	return v
 }
 
 func normalizeVacancyURL(raw string) string {
-	parsed, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil || parsed.Scheme != "https" {
+	parsed, err := url.ParseRequestURI(strings.TrimSpace(raw))
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil {
+		return ""
+	}
+	if port := parsed.Port(); port != "" && port != "443" {
 		return ""
 	}
 	host := strings.ToLower(parsed.Hostname())
@@ -419,6 +509,21 @@ func cleanText(value string) string {
 	value = strings.ReplaceAll(value, "<br />", "\n")
 	value = html.UnescapeString(htmlTagPattern.ReplaceAllString(value, " "))
 	return strings.Join(strings.Fields(value), " ")
+}
+
+func cleanTextBounded(value string, maxBytes int) string {
+	return truncateUTF8Bytes(cleanText(value), maxBytes)
+}
+
+func truncateUTF8Bytes(value string, maxBytes int) string {
+	if maxBytes <= 0 || len(value) <= maxBytes {
+		return value
+	}
+	value = value[:maxBytes]
+	for len(value) > 0 && !utf8.ValidString(value) {
+		value = value[:len(value)-1]
+	}
+	return strings.TrimSpace(value)
 }
 
 func parseAPITime(value string) time.Time {
@@ -437,12 +542,22 @@ func normalizeCurrency(value string) string {
 	switch value {
 	case "руб", "рубль", "рубли", "рублей", "rub", "rur", "₽":
 		return "RUB"
-	case "usd", "$":
+	case "usd", "$", "доллар", "доллары", "долларов":
 		return "USD"
-	case "eur", "€":
+	case "eur", "€", "евро":
 		return "EUR"
+	case "тенге", "₸", "kzt":
+		return "KZT"
+	case "юань", "юани", "cny", "¥":
+		return "CNY"
+	case "белорусскийрубль", "byn":
+		return "BYN"
 	default:
-		return strings.ToUpper(value)
+		upper := strings.ToUpper(value)
+		if len(upper) == 3 && upper[0] >= 'A' && upper[0] <= 'Z' && upper[1] >= 'A' && upper[1] <= 'Z' && upper[2] >= 'A' && upper[2] <= 'Z' {
+			return upper
+		}
+		return ""
 	}
 }
 

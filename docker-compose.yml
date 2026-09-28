@@ -1,63 +1,124 @@
+name: max-bot
+
+x-skillgap-image: &skillgap-image
+  image: skillgap:${SKILLGAP_IMAGE_TAG:-local}
+  build:
+    context: .
+    dockerfile: Dockerfile
+
+x-service-security: &service-security
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+x-service-logging: &service-logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "3"
+
 services:
   db:
-    image: postgres:17.0-alpine3.20
-    restart: always
-    container_name: max-db
-    env_file:
-      - .env
+    image: postgres:17.11-alpine3.24@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}" ]
-      interval: 10s
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 10s
     networks:
       - max-network
+    logging: *service-logging
 
   migrator:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    command: [ "./migrator" ]
+    <<: [*skillgap-image, *service-security]
+    command: ["./migrator"]
+    restart: "no"
     environment:
-      - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}?sslmode=disable
+      DATABASE_URL: >-
+        host=db port=5432 user=${POSTGRES_USER:?set POSTGRES_USER in .env}
+        password=${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+        dbname=${POSTGRES_DB:?set POSTGRES_DB in .env} sslmode=disable
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
     depends_on:
       db:
         condition: service_healthy
     networks:
       - max-network
+    logging: *service-logging
 
   app:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    <<: [*skillgap-image, *service-security]
     command: ["./max-bot"]
-    restart: always
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 40s
     ports:
       - "127.0.0.1:8080:8080"
     environment:
-      - MAX_BOT_TOKEN=${MAX_BOT_TOKEN}
-      - MAX_WEBHOOK_SECRET=${MAX_WEBHOOK_SECRET}
-      - MAX_WEBHOOK_URL=${MAX_WEBHOOK_URL:-}
-      - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}?sslmode=disable
-      - TRUDVSEM_BASE_URL=${TRUDVSEM_BASE_URL:-https://opendata.trudvsem.ru/api/v1/vacancies}
-      - TRUDVSEM_REQUEST_TIMEOUT=${TRUDVSEM_REQUEST_TIMEOUT:-25s}
-      - TRUDVSEM_MAX_RESPONSE_BYTES=${TRUDVSEM_MAX_RESPONSE_BYTES:-8388608}
-      - TRUDVSEM_REQUESTS_PER_SECOND=${TRUDVSEM_REQUESTS_PER_SECOND:-3}
-      - TRUDVSEM_MAX_PAGES_PER_QUERY=${TRUDVSEM_MAX_PAGES_PER_QUERY:-2}
-      - SKILLGAP_ANALYSIS_TIMEOUT=${SKILLGAP_ANALYSIS_TIMEOUT:-75s}
-      - SKILLGAP_MAX_QUERIES=${SKILLGAP_MAX_QUERIES:-6}
-      - SKILLGAP_QUERY_CONCURRENCY=${SKILLGAP_QUERY_CONCURRENCY:-3}
-      - SKILLGAP_PER_QUERY_LIMIT=${SKILLGAP_PER_QUERY_LIMIT:-100}
-      - SKILLGAP_MAX_VACANCIES=${SKILLGAP_MAX_VACANCIES:-50}
-      - SKILLGAP_PDF_MAX_VACANCIES=${SKILLGAP_PDF_MAX_VACANCIES:-15}
-      - SKILLGAP_ANALYSIS_WORKERS=${SKILLGAP_ANALYSIS_WORKERS:-4}
-      - SKILLGAP_ANALYSIS_QUEUE=${SKILLGAP_ANALYSIS_QUEUE:-100}
+      MAX_BOT_TOKEN: ${MAX_BOT_TOKEN:?set MAX_BOT_TOKEN in .env}
+      MAX_WEBHOOK_SECRET: ${MAX_WEBHOOK_SECRET:?set MAX_WEBHOOK_SECRET in .env}
+      MAX_WEBHOOK_URL: ${MAX_WEBHOOK_URL:-}
+      MAX_WEBHOOK_RECONCILE_INTERVAL: ${MAX_WEBHOOK_RECONCILE_INTERVAL:-30m}
+      MAX_WEBHOOK_MAX_BODY_BYTES: ${MAX_WEBHOOK_MAX_BODY_BYTES:-1048576}
+      DATABASE_URL: >-
+        host=db port=5432 user=${POSTGRES_USER:?set POSTGRES_USER in .env}
+        password=${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+        dbname=${POSTGRES_DB:?set POSTGRES_DB in .env} sslmode=disable
+      SKILLGAP_CATALOG_PATH: ${SKILLGAP_CATALOG_PATH:-/app/spo_program_vacancy_map.json}
+      SKILLGAP_CATALOG_POLICY: ${SKILLGAP_CATALOG_POLICY:-pilot}
+      TRUDVSEM_BASE_URL: ${TRUDVSEM_BASE_URL:-https://opendata.trudvsem.ru/api/v1/vacancies}
+      TRUDVSEM_REQUEST_TIMEOUT: ${TRUDVSEM_REQUEST_TIMEOUT:-25s}
+      TRUDVSEM_MAX_RESPONSE_BYTES: ${TRUDVSEM_MAX_RESPONSE_BYTES:-8388608}
+      TRUDVSEM_REQUESTS_PER_SECOND: ${TRUDVSEM_REQUESTS_PER_SECOND:-3}
+      TRUDVSEM_MAX_PAGES_PER_QUERY: ${TRUDVSEM_MAX_PAGES_PER_QUERY:-2}
+      SKILLGAP_ANALYSIS_TIMEOUT: ${SKILLGAP_ANALYSIS_TIMEOUT:-90s}
+      SKILLGAP_MAX_QUERIES: ${SKILLGAP_MAX_QUERIES:-6}
+      SKILLGAP_QUERY_CONCURRENCY: ${SKILLGAP_QUERY_CONCURRENCY:-3}
+      SKILLGAP_PER_QUERY_LIMIT: ${SKILLGAP_PER_QUERY_LIMIT:-100}
+      SKILLGAP_MAX_VACANCIES: ${SKILLGAP_MAX_VACANCIES:-50}
+      SKILLGAP_VACANCY_CACHE_MAX_BYTES: ${SKILLGAP_VACANCY_CACHE_MAX_BYTES:-33554432}
+      SKILLGAP_PDF_MAX_VACANCIES: ${SKILLGAP_PDF_MAX_VACANCIES:-15}
+      SKILLGAP_ANALYSIS_WORKERS: ${SKILLGAP_ANALYSIS_WORKERS:-4}
+      SKILLGAP_ANALYSIS_QUEUE: ${SKILLGAP_ANALYSIS_QUEUE:-100}
+      SKILLGAP_SESSION_TTL: ${SKILLGAP_SESSION_TTL:-24h}
+      SKILLGAP_DOCUMENT_TIMEOUT: ${SKILLGAP_DOCUMENT_TIMEOUT:-20s}
+      SKILLGAP_PDF_PARSE_TIMEOUT: ${SKILLGAP_PDF_PARSE_TIMEOUT:-15s}
+      SKILLGAP_PDF_MAX_MEMORY_BYTES: ${SKILLGAP_PDF_MAX_MEMORY_BYTES:-536870912}
+      SKILLGAP_DOCUMENT_CACHE_TTL: ${SKILLGAP_DOCUMENT_CACHE_TTL:-30m}
+      SKILLGAP_DOCUMENT_CACHE_MAX_BYTES: ${SKILLGAP_DOCUMENT_CACHE_MAX_BYTES:-33554432}
+      SKILLGAP_DOCUMENT_MAX_BYTES: ${SKILLGAP_DOCUMENT_MAX_BYTES:-20971520}
+      SKILLGAP_DOCUMENT_MAX_PAGES: ${SKILLGAP_DOCUMENT_MAX_PAGES:-300}
+      SKILLGAP_DOCUMENT_MAX_SKILLS: ${SKILLGAP_DOCUMENT_MAX_SKILLS:-100}
+      SKILLGAP_EVENT_WORKERS: ${SKILLGAP_EVENT_WORKERS:-20}
+      SKILLGAP_EVENT_QUEUE: ${SKILLGAP_EVENT_QUEUE:-10000}
+      SKILLGAP_EVENT_HANDLER_TIMEOUT: ${SKILLGAP_EVENT_HANDLER_TIMEOUT:-30s}
+      SKILLGAP_EVENT_MAX_ATTEMPTS: ${SKILLGAP_EVENT_MAX_ATTEMPTS:-8}
+      SKILLGAP_EVENT_PROCESSING_TIMEOUT: ${SKILLGAP_EVENT_PROCESSING_TIMEOUT:-2m}
+      SKILLGAP_EVENT_RECOVERY_INTERVAL: ${SKILLGAP_EVENT_RECOVERY_INTERVAL:-2s}
+      SKILLGAP_EVENT_RECOVERY_BATCH: ${SKILLGAP_EVENT_RECOVERY_BATCH:-500}
+      SKILLGAP_EVENT_CLEANUP_INTERVAL: ${SKILLGAP_EVENT_CLEANUP_INTERVAL:-6h}
+      SKILLGAP_EVENT_COMPLETED_TTL: ${SKILLGAP_EVENT_COMPLETED_TTL:-720h}
+      SKILLGAP_EVENT_FAILED_TTL: ${SKILLGAP_EVENT_FAILED_TTL:-168h}
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
     depends_on:
       db:
         condition: service_healthy
@@ -65,41 +126,88 @@ services:
         condition: service_completed_successfully
     networks:
       - max-network
-
-
-#  nginx:
-#    image: nginx:alpine
-#    container_name: max-nginx
-#    restart: always
-#    ports:
-#      - "8080:80"
-#      - "443:443"
-#    volumes:
-#      - ./nginx.conf:/etc/nginx/nginx.conf:ro
-#      - /etc/letsencrypt:/etc/letsencrypt:ro
-#    depends_on:
-#      - app
-#    networks:
-#      - max-network
+    logging: *service-logging
 
   prometheus:
-    image: prom/prometheus:v2.53.0
-    restart: always
+    image: prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
+    profiles: ["observability"]
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+    ports:
+      - "127.0.0.1:9090:9090"
     volumes:
-       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    depends_on:
+      app:
+        condition: service_healthy
     networks:
       - max-network
+    logging: *service-logging
+
+  observability-config:
+    image: alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+    profiles: ["observability"]
+    environment:
+      GRAFANA_PASSWORD: ${GRAFANA_PASSWORD:-}
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        case "$${GRAFANA_PASSWORD}" in
+          ""|replace_me_*)
+            echo "Set a strong GRAFANA_PASSWORD before enabling observability" >&2
+            exit 1
+            ;;
+        esac
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - max-network
+    logging: *service-logging
 
   grafana:
-    image: grafana/grafana:latest
-    container_name: grafana
-    restart: always
+    image: grafana/grafana:13.2.2@sha256:ac461fb352abc50da10a51c7d02462e9c05488f11f53f14b3ad79a8145f638a0
+    profiles: ["observability"]
+    restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/etc/grafana/dashboards:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    depends_on:
+      observability-config:
+        condition: service_completed_successfully
+      prometheus:
+        condition: service_started
     networks:
       - max-network
+    logging: *service-logging
 
 networks:
   max-network:
@@ -107,3 +215,5 @@ networks:
 
 volumes:
   pgdata:
+  prometheus_data:
+  grafana_data:

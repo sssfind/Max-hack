@@ -1,40 +1,115 @@
-version: '3'
+version: "3"
 
 vars:
-  BIN_DIR: '{{.ROOT_DIR}}/bin'
-  GOLANGCI_LINT: '{{.BIN_DIR}}/golangci-lint'
-  GOLANGCI_LINT_VERSION: 'v1.64.8'
+  BIN_DIR: "{{.ROOT_DIR}}/bin"
+  GOLANGCI_LINT: "{{.BIN_DIR}}/golangci-lint{{exeExt}}"
+  GOVULNCHECK: "{{.BIN_DIR}}/govulncheck{{exeExt}}"
+  GOLANGCI_LINT_VERSION: v2.14.0
+  GOVULNCHECK_VERSION: v1.1.4
 
 tasks:
-  install-lint:
-    desc: "Устанавливает golangci-lint в каталог bin"
+  tools:
+    desc: Установить зафиксированные версии инструментов в ./bin
     cmds:
-      - |
-        [ -f {{.GOLANGCI_LINT}} ] || {
-          mkdir -p {{.BIN_DIR}}
-          echo "📦 Устанавливаем golangci-lint..."
-          GOBIN={{.BIN_DIR}} go install github.com/golangci/golangci-lint/cmd/golangci-lint@{{.GOLANGCI_LINT_VERSION}}
-        }
-    status:
-      - test -x {{.GOLANGCI_LINT}}
+      - go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@{{.GOLANGCI_LINT_VERSION}}
+      - go install golang.org/x/vuln/cmd/govulncheck@{{.GOVULNCHECK_VERSION}}
+    env:
+      GOBIN: "{{.BIN_DIR}}"
+    sources:
+      - Taskfile.yml
+    generates:
+      - "{{.GOLANGCI_LINT}}"
+      - "{{.GOVULNCHECK}}"
+
+  fmt:
+    desc: Отформатировать Go-код
+    cmds:
+      - go fmt ./...
+
+  vet:
+    desc: Запустить go vet
+    cmds:
+      - go vet ./...
 
   lint:
-    desc: "Запускает линтер для проекта"
-    deps: [ install-lint ]
+    desc: Запустить golangci-lint
+    deps: [tools]
     cmds:
-      - '{{.GOLANGCI_LINT}} run ./... --timeout=3m'
+      - '"{{.GOLANGCI_LINT}}" run ./... --timeout=5m'
 
   test:
-    desc: "Запускает юнит-тесты"
+    desc: Запустить юнит-тесты
     cmds:
-      - go test -v ./...
+      - go test -count=1 ./...
+
+  test-race:
+    desc: Запустить тесты с race detector
+    cmds:
+      - go test -race -count=1 ./...
+
+  test-coverage:
+    desc: Собрать отчёт о покрытии в coverage.out
+    cmds:
+      - go test -count=1 -covermode=atomic "-coverprofile=coverage.out" ./...
+      - go tool cover -func=coverage.out
+
+  vuln:
+    desc: Проверить достижимые уязвимости Go
+    deps: [tools]
+    cmds:
+      - '"{{.GOVULNCHECK}}" ./...'
+
+  build-go:
+    desc: Собрать все Go-команды
+    cmds:
+      - go build ./cmd/...
+
+  verify:
+    desc: Полная локальная проверка перед push
+    cmds:
+      - task: vet
+      - task: lint
+      - task: test-race
+      - task: test-coverage
+      - task: vuln
+      - task: build-go
+
+  compose:
+    desc: Проверить конфигурацию Docker Compose на безопасном примере
+    cmds:
+      - docker compose --env-file .env.example --profile observability config --quiet
+
+  build:
+    desc: Собрать production-образ
+    cmds:
+      - docker build --pull --tag skillgap:local .
 
   up:
-    desc: "Поднять всю инфраструктуру"
+    desc: Собрать и запустить обязательный контур
     cmds:
-      - docker-compose up -d --build
+      - docker compose up -d --build
+
+  observability:
+    desc: Запустить SkillGap, Prometheus и Grafana
+    cmds:
+      - docker compose --profile observability up -d --build
+
+  restart:
+    desc: Перезапустить приложение
+    cmds:
+      - docker compose restart app
+
+  logs:
+    desc: Показать логи приложения
+    cmds:
+      - docker compose logs --follow app
+
+  status:
+    desc: Показать статус контейнеров
+    cmds:
+      - docker compose ps
 
   down:
-    desc: "Убить контейнеры и очистить вольюмы"
+    desc: Остановить контейнеры, сохранив PostgreSQL volume
     cmds:
-      - docker-compose down -v
+      - docker compose --profile observability down

@@ -41,6 +41,37 @@ type fakeMessenger struct {
 	files    chan recordedFile
 }
 
+type answerFailingMessenger struct {
+	*fakeMessenger
+	err error
+}
+
+type analysisOutputFailingMessenger struct {
+	mu           sync.Mutex
+	err          error
+	messageCalls int
+}
+
+func (m *analysisOutputFailingMessenger) SendMessage(context.Context, int64, int64, maxapi.NewMessageBody) error {
+	m.mu.Lock()
+	m.messageCalls++
+	m.mu.Unlock()
+	return m.err
+}
+
+func (*analysisOutputFailingMessenger) AnswerCallback(context.Context, string, int64, maxapi.SendAnswerRequest) error {
+	return nil
+}
+
+func (m *analysisOutputFailingMessenger) SendFile(context.Context, int64, int64, string, []byte, string, ...[]maxapi.Button) error {
+	return m.err
+}
+
+func (m answerFailingMessenger) AnswerCallback(_ context.Context, callbackID string, chatID int64, req maxapi.SendAnswerRequest) error {
+	m.answers <- recordedAnswer{callbackID: callbackID, chatID: chatID, req: req}
+	return m.err
+}
+
 func newFakeMessenger() *fakeMessenger {
 	return &fakeMessenger{
 		answers: make(chan recordedAnswer, 10), messages: make(chan recordedMessage, 10), files: make(chan recordedFile, 10),
@@ -94,6 +125,11 @@ type fakeReportGenerator struct {
 	err      error
 }
 
+func withAllCatalog(cfg AnalysisConfig) AnalysisConfig {
+	cfg.CatalogPolicy = catalog.ReviewPolicyAll
+	return cfg
+}
+
 type cancelAwareAnalyzer struct {
 	started  chan struct{}
 	canceled chan struct{}
@@ -124,7 +160,7 @@ func TestAnalyzeCallbackAcknowledgesImmediatelyAndSendsResults(t *testing.T) {
 		stats: vacancies.Statistics{VacancyCount: 1, EmployerCount: 1, SalaryCount: 1, SalaryCoveragePercent: 100, SalaryMedian: &salary, SalaryMin: &salary, SalaryMax: &salary, Currency: "RUB", EntryLevelPercent: 100, SmallSample: true},
 	}
 	reporter := fakeReportGenerator{document: pdfreport.Document{Filename: "report.pdf", MediaType: "application/pdf", Data: []byte("%PDF-test")}}
-	h := NewHandler(messenger, cat, analyzer, reporter, AnalysisConfig{Workers: 1, Queue: 2, Timeout: 5 * time.Second})
+	h := NewHandler(messenger, cat, analyzer, reporter, withAllCatalog(AnalysisConfig{Workers: 1, Queue: 2, Timeout: 5 * time.Second}))
 	h.sessions.set(42, session{Step: stepReady, RegionCode: "7700000000000", RegionName: "Москва", ProgramCode: "09.02.07", Qualification: "Программист"})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -173,7 +209,7 @@ func TestAnalyzeCallbackDoesNotQueueDuplicateJob(t *testing.T) {
 	messenger := newFakeMessenger()
 	release := make(chan struct{})
 	analyzer := &blockingAnalyzer{started: make(chan struct{}), release: release, err: errors.New("source unavailable")}
-	h := NewHandler(messenger, cat, analyzer, fakeReportGenerator{}, AnalysisConfig{Workers: 1, Queue: 2, Timeout: 5 * time.Second})
+	h := NewHandler(messenger, cat, analyzer, fakeReportGenerator{}, withAllCatalog(AnalysisConfig{Workers: 1, Queue: 2, Timeout: 5 * time.Second}))
 	h.sessions.set(7, session{Step: stepReady, RegionCode: "7700000000000", RegionName: "Москва", ProgramCode: "09.02.07", Qualification: "Программист"})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -204,6 +240,123 @@ func TestAnalyzeCallbackDoesNotQueueDuplicateJob(t *testing.T) {
 	}
 }
 
+func TestFullAnalysisQueueKeepsRetryAction(t *testing.T) {
+	messenger := newFakeMessenger()
+	h := NewHandler(
+		messenger, loadTestCatalog(t),
+		&blockingAnalyzer{started: make(chan struct{}), release: make(chan struct{})},
+		fakeReportGenerator{}, withAllCatalog(AnalysisConfig{Workers: 1, Queue: 1, Timeout: time.Second}),
+	)
+	h.sessions.set(72, session{Step: stepReady, RegionCode: "7700000000000", RegionName: "Москва", ProgramCode: "09.02.07", Qualification: "Программист"})
+	h.analysis.started.Store(true)
+	h.analysis.jobs <- analysisJob{}
+
+	h.onCallback(context.Background(), analysisUpdate(72, "queue-full"))
+	answer := receive(t, messenger.answers)
+	if answer.req.Message == nil || answer.req.Message.Text == nil || !strings.Contains(*answer.req.Message.Text, "слишком много запросов") {
+		t.Fatalf("queue-full response = %#v", answer.req)
+	}
+	if !hasCallbackPrefix(inlineKeyboardButtons(*answer.req.Message), payloadAnalyze) {
+		t.Fatalf("queue-full response has no retry action: %#v", answer.req.Message)
+	}
+}
+
+func TestCompletedAnalysisIsNotRelaunchedWhenCallbackDeliveryFailed(t *testing.T) {
+	cat := loadTestCatalog(t)
+	recorded := newFakeMessenger()
+	messenger := answerFailingMessenger{fakeMessenger: recorded, err: temporaryDeliveryError{}}
+	release := make(chan struct{})
+	close(release)
+	analyzer := &blockingAnalyzer{started: make(chan struct{}), release: release}
+	h := NewHandler(messenger, cat, analyzer, fakeReportGenerator{}, withAllCatalog(AnalysisConfig{Workers: 1, Queue: 2, Timeout: 5 * time.Second}))
+	h.sessions.set(71, session{Step: stepReady, RegionCode: "7700000000000", RegionName: "Москва", ProgramCode: "09.02.07", Qualification: "Программист"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	h.StartAnalysisWorkers(ctx)
+	t.Cleanup(func() {
+		cancel()
+		h.WaitAnalysisWorkers()
+	})
+	update := analysisUpdate(71, "same-callback")
+	if err := h.Handle(context.Background(), update); err == nil {
+		t.Fatal("first Handle() unexpectedly succeeded")
+	}
+	receive(t, recorded.answers)
+	receive(t, analyzer.started)
+	waitFor(t, func() bool { return h.sessions.get(71).Step == stepReady })
+
+	if err := h.Handle(context.Background(), update); err != nil {
+		t.Fatalf("completed callback retry returned error: %v", err)
+	}
+	select {
+	case second := <-recorded.answers:
+		t.Fatalf("completed analysis replayed stale start acknowledgement: %#v", second.req)
+	default:
+	}
+	analyzer.mu.Lock()
+	calls := analyzer.calls
+	analyzer.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("Analyze calls = %d, want exactly 1 after callback retry", calls)
+	}
+}
+
+func TestSkillTermsKeepGenericConceptsPartial(t *testing.T) {
+	tests := []struct {
+		skill   string
+		generic string
+	}{
+		{skill: "SQL", generic: "реляционные базы данных"},
+		{skill: "Microsoft Excel", generic: "электронные таблицы"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.skill, func(t *testing.T) {
+			aliases, partial := skillTerms(tt.skill)
+			if containsFold(aliases, tt.generic) {
+				t.Fatalf("generic concept %q is still a full-match alias: %#v", tt.generic, aliases)
+			}
+			if !containsFold(partial, tt.generic) {
+				t.Fatalf("generic concept %q is missing from partial terms: %#v", tt.generic, partial)
+			}
+		})
+	}
+}
+
+func TestPilotPolicyRejectsRestoredUnreviewedAnalysis(t *testing.T) {
+	cat := loadTestCatalog(t)
+	messenger := newFakeMessenger()
+	analyzer := &blockingAnalyzer{started: make(chan struct{}), release: make(chan struct{})}
+	h := NewHandler(messenger, cat, analyzer, fakeReportGenerator{}, AnalysisConfig{
+		Workers: 1, Queue: 1, Timeout: time.Second, CatalogPolicy: catalog.ReviewPolicyPilot,
+	})
+	h.sessions.set(70, session{
+		Step: stepReady, RegionCode: "7700000000000", RegionName: "Москва",
+		ProgramCode: "09.02.07", Qualification: "Программист",
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	h.StartAnalysisWorkers(ctx)
+	t.Cleanup(func() {
+		cancel()
+		h.WaitAnalysisWorkers()
+	})
+
+	h.onCallback(context.Background(), analysisUpdate(70, "pilot-gate"))
+	answer := receive(t, messenger.answers)
+	if answer.req.Message == nil || answer.req.Message.Text == nil || !strings.Contains(*answer.req.Message.Text, "проверенный пилотный набор") {
+		t.Fatalf("unexpected pilot rejection: %#v", answer.req)
+	}
+	if got := h.sessions.get(70).Step; got != stepReady {
+		t.Fatalf("rejected analysis changed step to %q", got)
+	}
+	select {
+	case <-analyzer.started:
+		t.Fatal("unreviewed restored program bypassed pilot policy")
+	default:
+	}
+}
+
 func TestAnalyzeButtonCanBeReusedAfterFinish(t *testing.T) {
 	cat := loadTestCatalog(t)
 	messenger := newFakeMessenger()
@@ -216,7 +369,7 @@ func TestAnalyzeButtonCanBeReusedAfterFinish(t *testing.T) {
 			Source: "Работа России", FetchedAt: time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC), Mode: vacancies.ModeLive,
 		},
 	}
-	h := NewHandler(messenger, cat, analyzer, fakeReportGenerator{}, AnalysisConfig{Workers: 1, Queue: 2, Timeout: time.Second})
+	h := NewHandler(messenger, cat, analyzer, fakeReportGenerator{}, withAllCatalog(AnalysisConfig{Workers: 1, Queue: 2, Timeout: time.Second}))
 	h.sessions.set(17, session{Step: stepReady, RegionCode: "7700000000000", RegionName: "Москва", ProgramCode: "09.02.07", Qualification: "Программист"})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -259,7 +412,7 @@ func TestRestartCancelsActiveAnalysis(t *testing.T) {
 	cat := loadTestCatalog(t)
 	messenger := newFakeMessenger()
 	analyzer := &cancelAwareAnalyzer{started: make(chan struct{}), canceled: make(chan struct{})}
-	h := NewHandler(messenger, cat, analyzer, fakeReportGenerator{}, AnalysisConfig{Workers: 1, Queue: 1, Timeout: time.Second})
+	h := NewHandler(messenger, cat, analyzer, fakeReportGenerator{}, withAllCatalog(AnalysisConfig{Workers: 1, Queue: 1, Timeout: time.Second}))
 	h.sessions.set(88, session{Step: stepReady, RegionCode: "7700000000000", RegionName: "Москва", ProgramCode: "09.02.07", Qualification: "Программист"})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -288,7 +441,7 @@ func TestOldAnalyzeButtonCannotStartCurrentSelection(t *testing.T) {
 	cat := loadTestCatalog(t)
 	messenger := newFakeMessenger()
 	analyzer := &blockingAnalyzer{started: make(chan struct{}), release: make(chan struct{})}
-	h := NewHandler(messenger, cat, analyzer, fakeReportGenerator{}, AnalysisConfig{})
+	h := NewHandler(messenger, cat, analyzer, fakeReportGenerator{}, withAllCatalog(AnalysisConfig{}))
 	h.sessions.set(99, session{
 		Step: stepReady, Generation: 4, RegionCode: "7700000000000", RegionName: "Москва",
 		ProgramCode: "09.02.07", Qualification: "Программист",
@@ -320,7 +473,7 @@ func TestOldAnalyzeButtonCannotStartCurrentSelection(t *testing.T) {
 func TestSessionResetDoesNotLetOldAnalysisOverwriteSelection(t *testing.T) {
 	store := newSessionStore()
 	store.set(1, session{Step: stepReady, RegionCode: "77", ProgramCode: "09.02.07"})
-	selected, err := store.startAnalysis(1, 0, "09.02.07", func() {})
+	selected, err := store.startAnalysis(1, 0, "09.02.07", "callback-1", func() {})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -337,7 +490,7 @@ func TestSessionResetAtomicallyCancelsStartedAnalysis(t *testing.T) {
 	lifecycle, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	selected, err := store.startAnalysis(1, 0, "09.02.07", cancel)
+	selected, err := store.startAnalysis(1, 0, "09.02.07", "callback-1", cancel)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -357,12 +510,12 @@ func TestFinishedAnalysisCanBeRepeatedFromSameButton(t *testing.T) {
 	store := newSessionStore()
 	store.set(1, session{Step: stepReady, Generation: 7, RegionCode: "77", ProgramCode: "09.02.07"})
 
-	first, err := store.startAnalysis(1, 7, "09.02.07", func() {})
+	first, err := store.startAnalysis(1, 7, "09.02.07", "callback-1", func() {})
 	if err != nil {
 		t.Fatal(err)
 	}
 	store.finishAnalysis(1, first.Generation, first.AnalysisID)
-	second, err := store.startAnalysis(1, 7, "09.02.07", func() {})
+	second, err := store.startAnalysis(1, 7, "09.02.07", "callback-2", func() {})
 	if err != nil {
 		t.Fatalf("same generation button could not repeat analysis: %v", err)
 	}
@@ -378,11 +531,11 @@ func TestAnalysisTimeoutStillNotifiesUser(t *testing.T) {
 	cat := loadTestCatalog(t)
 	messenger := newFakeMessenger()
 	analyzer := &blockingAnalyzer{started: make(chan struct{}), release: make(chan struct{})}
-	h := NewHandler(messenger, cat, analyzer, fakeReportGenerator{}, AnalysisConfig{
+	h := NewHandler(messenger, cat, analyzer, fakeReportGenerator{}, withAllCatalog(AnalysisConfig{
 		Workers: 1,
 		Queue:   1,
 		Timeout: 25 * time.Millisecond,
-	})
+	}))
 	h.sessions.set(55, session{Step: stepReady, RegionCode: "7700000000000", RegionName: "Москва", ProgramCode: "09.02.07", Qualification: "Программист"})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -403,6 +556,85 @@ func TestAnalysisTimeoutStillNotifiesUser(t *testing.T) {
 	waitFor(t, func() bool { return h.sessions.get(55).Step == stepReady })
 }
 
+func TestAnalysisDeliveryFailureRemainsVisibleAfterRestart(t *testing.T) {
+	repository := newMemorySessionRepository()
+	messenger := &analysisOutputFailingMessenger{err: errors.New("MAX unavailable")}
+	release := make(chan struct{})
+	close(release)
+	analyzer := &blockingAnalyzer{
+		started: make(chan struct{}), release: release,
+		result: vacancies.Snapshot{
+			Vacancies: []vacancies.Vacancy{{ID: "v1", Title: "Стажёр"}},
+			Source:    "Работа России", FetchedAt: time.Now(), Mode: vacancies.ModeLive,
+		},
+		stats: vacancies.Statistics{VacancyCount: 1, EmployerCount: 1},
+	}
+	h := NewHandlerWithSessionRepository(
+		messenger, loadTestCatalog(t), analyzer, fakeReportGenerator{},
+		withAllCatalog(AnalysisConfig{Timeout: time.Minute}), repository, time.Hour,
+	)
+	h.sessions.set(57, session{
+		Step: stepReady, RegionCode: "7700000000000", RegionName: "Москва",
+		ProgramCode: "09.02.07", Qualification: "Программист",
+	})
+	lifecycle, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	selected, err := h.sessions.startAnalysis(57, 0, "09.02.07", "delivery-failure", cancel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	program, ok := h.catalog.Get("09.02.07")
+	if !ok {
+		t.Fatal("test program not found")
+	}
+	h.analysis.run(lifecycle, lifecycle, analysisJob{
+		chatID: 57, userID: 9, selection: selected, program: program,
+		queries: vacancyQueries(program, selected.Qualification), startedAt: time.Now(), lifecycle: lifecycle, cancel: cancel,
+	})
+
+	messenger.mu.Lock()
+	messageCalls := messenger.messageCalls
+	messenger.mu.Unlock()
+	if messageCalls != 2 {
+		t.Fatalf("message delivery attempts = %d, want result and failure notice", messageCalls)
+	}
+	restored := newSessionStoreWithRepository(repository, time.Hour).get(57)
+	if restored.Step != stepReady || !restored.AnalysisDeliveryFailed || restored.AnalysisInterrupted {
+		t.Fatalf("delivery failure was not persisted as retryable state: %+v", restored)
+	}
+}
+
+func TestAnalysisShutdownIsRestoredAsInterrupted(t *testing.T) {
+	repository := newMemorySessionRepository()
+	messenger := newFakeMessenger()
+	analyzer := &cancelAwareAnalyzer{started: make(chan struct{}), canceled: make(chan struct{})}
+	h := NewHandlerWithSessionRepository(
+		messenger, loadTestCatalog(t), analyzer, fakeReportGenerator{},
+		withAllCatalog(AnalysisConfig{Workers: 1, Queue: 1, Timeout: time.Minute}), repository, time.Hour,
+	)
+	h.sessions.set(56, session{Step: stepReady, RegionCode: "7700000000000", RegionName: "Москва", ProgramCode: "09.02.07", Qualification: "Программист"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	h.StartAnalysisWorkers(ctx)
+	h.onCallback(context.Background(), analysisUpdate(56, "shutdown"))
+	receive(t, messenger.answers)
+	receive(t, analyzer.started)
+	cancel()
+	receive(t, analyzer.canceled)
+	h.WaitAnalysisWorkers()
+
+	repository.mu.Lock()
+	persisted := repository.sessions[56]
+	repository.mu.Unlock()
+	if persisted.Step != stepAnalyzing {
+		t.Fatalf("persisted shutdown state = %q, want analyzing", persisted.Step)
+	}
+	restored := newSessionStoreWithRepository(repository, time.Hour).get(56)
+	if restored.Step != stepReady || !restored.AnalysisInterrupted {
+		t.Fatalf("restored shutdown analysis = %+v, want ready/interrupted", restored)
+	}
+}
+
 func TestOldAnalysisFailureIsNotSentAfterRestart(t *testing.T) {
 	cat := loadTestCatalog(t)
 	messenger := newFakeMessenger()
@@ -410,7 +642,7 @@ func TestOldAnalysisFailureIsNotSentAfterRestart(t *testing.T) {
 	analyzer := &blockingAnalyzer{
 		started: make(chan struct{}), release: release, err: errors.New("source unavailable"),
 	}
-	h := NewHandler(messenger, cat, analyzer, fakeReportGenerator{}, AnalysisConfig{Workers: 1, Queue: 1, Timeout: time.Second})
+	h := NewHandler(messenger, cat, analyzer, fakeReportGenerator{}, withAllCatalog(AnalysisConfig{Workers: 1, Queue: 1, Timeout: time.Second}))
 	h.sessions.set(77, session{Step: stepReady, RegionCode: "7700000000000", RegionName: "Москва", ProgramCode: "09.02.07", Qualification: "Программист"})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -449,6 +681,22 @@ func TestSessionUpdateIfRejectsStaleGeneration(t *testing.T) {
 	}
 }
 
+func TestExpiredSessionIsRemovedAndAnalysisCanceled(t *testing.T) {
+	store := newSessionStoreWithTTL(10 * time.Millisecond)
+	lifecycle, cancel := context.WithCancel(context.Background())
+	store.byChat[1] = session{
+		Step: stepAnalyzing, UpdatedAt: time.Now().Add(-time.Second), analysisCancel: cancel,
+	}
+	if got := store.get(1); got.Step != stepIdle {
+		t.Fatalf("expired session returned as %+v", got)
+	}
+	select {
+	case <-lifecycle.Done():
+	case <-time.After(time.Second):
+		t.Fatal("expired session did not cancel analysis")
+	}
+}
+
 func TestQualificationPayloadIncludesProgramAndValidIndex(t *testing.T) {
 	programCode, index, ok := parseQualificationPayload("09.02.07:2")
 	if !ok || programCode != "09.02.07" || index != 2 {
@@ -470,6 +718,21 @@ func TestAnalyzePayloadBindsGenerationAndProgram(t *testing.T) {
 		if _, _, ok := parseAnalyzePayload(payload); ok {
 			t.Errorf("invalid payload %q was accepted", payload)
 		}
+	}
+}
+
+func TestSalaryFormattingDoesNotInventCurrency(t *testing.T) {
+	t.Parallel()
+
+	from, to := int64(60_000), int64(90_000)
+	if got := formatSalaryRange(&from, &to, ""); got != "60 000 - 90 000 (валюта не указана)" {
+		t.Errorf("unknown-currency range = %q", got)
+	}
+	if got := formatSalaryRange(&from, nil, "RUB"); got != "от 60 000 ₽" {
+		t.Errorf("RUB salary = %q", got)
+	}
+	if got := formatMoney(from, ""); got != "60 000 (валюта не указана)" {
+		t.Errorf("unknown-currency amount = %q", got)
 	}
 }
 

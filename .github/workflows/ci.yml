@@ -1,64 +1,428 @@
-name: CI/CD Pipeline
+name: CI/CD
 
 on:
   push:
-    branches:
-      - master
-      - main
+    branches: [main, master]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   check-and-test:
+    name: Go quality and security
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TEST_DATABASE_URL: postgres://skillgap_test:skillgap_test@127.0.0.1:5432/skillgap_test?sslmode=disable
+    services:
+      postgres:
+        image: postgres:17.11-alpine3.24@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+        env:
+          POSTGRES_USER: skillgap_test
+          POSTGRES_PASSWORD: skillgap_test
+          POSTGRES_DB: skillgap_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U skillgap_test -d skillgap_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    concurrency:
+      group: ci-${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6.2.0
         with:
-          go-version: '1.26'
+          go-version: "1.26.8"
           cache: true
+          check-latest: false
 
-      - name: Install Task
-        uses: arduino/setup-task@v2.0.0
-
-      - name: Cache bin directory
-        uses: actions/cache@v6
+      - name: Set up Task
+        uses: arduino/setup-task@b91d5d2c96a56797b48ac1e0e89220bf64044611 # v2.0.0
         with:
-          path: bin/
-          key: ${{ runner.os }}-go-bin-${{ hashFiles('Taskfile.yml') }}
+          version: 3.53.1
 
-      - name: Run Linter
+      - name: Cache project tools
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            bin
+            .task
+          key: ${{ runner.os }}-${{ runner.arch }}-go1.26.8-tools-${{ hashFiles('Taskfile.yml') }}
+
+      - name: Verify module checksums
+        run: go mod verify
+
+      - name: Check formatting
+        shell: bash
+        run: |
+          unformatted="$(find cmd internal -type f -name '*.go' -print0 | xargs -0 gofmt -l)"
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: task vet
+
+      - name: Lint
         run: task lint
 
-      - name: Run Tests
-        run: task test
+      - name: Test with race detector
+        run: task test-race
+
+      - name: Check coverage floor
+        shell: bash
+        run: |
+          go test -count=1 -covermode=atomic -coverprofile=coverage.out ./...
+          go tool cover -func=coverage.out
+          total="$(go tool cover -func=coverage.out | awk '/^total:/ {gsub("%", "", $3); print $3}')"
+          awk -v total="$total" 'BEGIN { if (total < 60) { printf "Coverage %.1f%% is below 60%%\n", total; exit 1 } }'
+
+      - name: Build all commands
+        run: task build-go
+
+      - name: Check reachable Go vulnerabilities
+        run: task vuln
+
+      - name: Scan repository for secrets and critical findings
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+
+  container:
+    name: Container and migration smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: container-${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Validate Compose
+        run: docker compose --env-file .env.example --profile observability config --quiet
+
+      - name: Validate Prometheus configuration
+        run: >-
+          docker run --rm --entrypoint /bin/promtool
+          --volume "$PWD/prometheus.yml:/etc/prometheus/prometheus.yml:ro"
+          prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
+          check config /etc/prometheus/prometheus.yml
+
+      - name: Build production image
+        run: docker build --pull --tag "skillgap:${GITHUB_SHA}" .
+
+      - name: Scan production image
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        with:
+          image-ref: skillgap:${{ github.sha }}
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+
+      - name: Smoke-test PostgreSQL migrations
+        env:
+          SKILLGAP_IMAGE_TAG: ${{ github.sha }}
+        run: >-
+          docker compose --env-file .env.example
+          up --no-build --abort-on-container-exit --exit-code-from migrator migrator
+
+      - name: Export verified production image
+        shell: bash
+        run: |
+          docker image save "skillgap:${GITHUB_SHA}" | gzip -n > skillgap-image.tar.gz
+          sha256sum skillgap-image.tar.gz > skillgap-image.tar.gz.sha256
+
+      - name: Upload verified production image
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: skillgap-image-${{ github.sha }}
+          path: |
+            skillgap-image.tar.gz
+            skillgap-image.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Remove smoke-test resources
+        if: always()
+        env:
+          SKILLGAP_IMAGE_TAG: ${{ github.sha }}
+        run: docker compose --env-file .env.example down --volumes --remove-orphans
 
   deploy:
-    needs: check-and-test
+    name: Deploy production
+    needs: [check-and-test, container]
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
-
+    timeout-minutes: 20
+    environment: production
+    concurrency:
+      group: skillgap-production
+      cancel-in-progress: false
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - name: Copy files via SCP
-        uses: appleboy/scp-action@v0.1.7
+      - name: Download verified production image
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: skillgap-image-${{ github.sha }}
+
+      - name: Verify image artifact checksum
+        run: sha256sum --check skillgap-image.tar.gz.sha256
+
+      - name: Verify deployment secrets
+        shell: bash
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+          SERVER_FINGERPRINT: ${{ secrets.SERVER_FINGERPRINT }}
+          BACKUP_ENCRYPTION_PASSWORD: ${{ secrets.BACKUP_ENCRYPTION_PASSWORD }}
+        run: |
+          test -n "$SERVER_HOST"
+          test -n "$SERVER_USER"
+          test -n "$SERVER_SSH_KEY"
+          test -n "$SERVER_FINGERPRINT"
+          test -n "$BACKUP_ENCRYPTION_PASSWORD"
+
+      - name: Upload immutable release
+        uses: appleboy/scp-action@ff85246acaad7bdce478db94a363cd2bf7c90345 # v1.0.0
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
-          source: "."
-          target: "/opt/max-bot"
+          fingerprint: ${{ secrets.SERVER_FINGERPRINT }}
+          source: "cmd,internal,deploy,spo_program_vacancy_map.json,go.mod,go.sum,Dockerfile,docker-compose.yml,prometheus.yml,README.md,.env.example,.dockerignore,THIRD_PARTY_NOTICES,skillgap-image.tar.gz,skillgap-image.tar.gz.sha256"
+          target: /opt/max-bot/releases/${{ github.sha }}
+          overwrite: true
 
-      - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1.0.3
+      - name: Start release and verify readiness
+        uses: appleboy/ssh-action@823bd89e131d8d508129f9443cad5855e9ba96f0 # v1.2.4
+        env:
+          BACKUP_ENCRYPTION_PASSWORD: ${{ secrets.BACKUP_ENCRYPTION_PASSWORD }}
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
+          fingerprint: ${{ secrets.SERVER_FINGERPRINT }}
+          envs: BACKUP_ENCRYPTION_PASSWORD
+          script_stop: true
+          command_timeout: 15m
           script: |
-            cd /opt/max-bot
-            docker compose up -d --build
+            bash -se <<'SKILLGAP_DEPLOY'
+            set -o pipefail
+
+            release_root=/opt/max-bot/releases
+            release_dir="${release_root}/${{ github.sha }}"
+            env_file=/opt/max-bot/.env
+            retention_days=30
+            retention_hours=720
+
+            test "$(readlink -f "$release_root")" = "$release_root"
+            release_dir="$(readlink -f "$release_dir")"
+            case "$release_dir" in
+              /opt/max-bot/releases/*) ;;
+              *) echo "Unexpected release directory" >&2; exit 1 ;;
+            esac
+
+            test -f "$env_file"
+            test -f "$release_dir/docker-compose.yml"
+
+            cd "$release_dir"
+            sha256sum --check skillgap-image.tar.gz.sha256
+            gzip -dc skillgap-image.tar.gz | docker image load
+            docker image inspect "skillgap:${{ github.sha }}" >/dev/null
+
+            previous_dir=""
+            if [ -e /opt/max-bot/current ] || [ -L /opt/max-bot/current ]; then
+              previous_dir="$(readlink -f /opt/max-bot/current 2>/dev/null || true)"
+            fi
+            if [ -z "$previous_dir" ] && [ -f /opt/max-bot/docker-compose.yml ]; then
+              previous_dir=/opt/max-bot
+            fi
+            if [ -n "$previous_dir" ]; then
+              case "$previous_dir" in
+                /opt/max-bot|/opt/max-bot/releases/*) ;;
+                *) echo "Refusing to use previous release outside /opt/max-bot" >&2; exit 1 ;;
+              esac
+            fi
+
+            schema_changed=1
+            if [ -n "$previous_dir" ] && [ -d "$previous_dir/cmd/migrator/migrations" ]; then
+              if diff -qr "$previous_dir/cmd/migrator/migrations" "$release_dir/cmd/migrator/migrations" >/dev/null; then
+                schema_changed=0
+              fi
+            fi
+
+            if [ "$schema_changed" -eq 1 ] && [ -n "$previous_dir" ] && [ -f "$previous_dir/docker-compose.yml" ]; then
+              test -n "${BACKUP_ENCRYPTION_PASSWORD:-}" || {
+                echo "BACKUP_ENCRYPTION_PASSWORD is required for a schema-changing release" >&2
+                exit 1
+              }
+              cd "$previous_dir"
+              docker compose -p max-bot --env-file "$env_file" up -d --wait db
+              umask 077
+              backup_dir=/opt/max-bot/backups
+              mkdir -p "$backup_dir"
+              test "$(readlink -f "$backup_dir")" = /opt/max-bot/backups
+              # EXIT traps cover ordinary failures. Also reap abandoned
+              # unpublished files from a killed host/SSH process; production
+              # deploys are serialized, and the one-day grace avoids touching
+              # a manually inspected fresh artifact.
+              find "$backup_dir" -maxdepth 1 -type f \
+                \( -name 'before-*.dump.enc.run-*.tmp' -o -name 'before-*.dump.enc.run-*.tmp.sha256' \) \
+                -mmin +1440 -delete
+              backup_file="${backup_dir}/before-${{ github.sha }}.dump.enc"
+              checksum_file="${backup_file}.sha256"
+              temporary_backup="${backup_file}.run-${{ github.run_id }}-attempt-${{ github.run_attempt }}.tmp"
+              temporary_checksum="${temporary_backup}.sha256"
+              cleanup_backup_temporaries() {
+                rm -f -- "$temporary_backup" "$temporary_checksum"
+              }
+              trap cleanup_backup_temporaries EXIT
+              if [ -f "$backup_file" ]; then
+                # A failed deployment may already have applied migrations.
+                # Reuse the original pre-migration backup and never replace it
+                # with a later post-migration dump of the same commit.
+                if [ ! -e "$checksum_file" ]; then
+                  # Publishing the two files cannot be atomic. If the previous
+                  # run stopped between the moves, recover the checksum from
+                  # the already-complete, immutable backup instead of either
+                  # overwriting that backup or blocking every retry.
+                  checksum="$(sha256sum "$backup_file" | awk '{print $1}')"
+                  printf '%s  %s\n' "$checksum" "$(basename "$backup_file")" >"$temporary_checksum"
+                  mv -n "$temporary_checksum" "$checksum_file"
+                fi
+                test -f "$checksum_file"
+                (cd "$backup_dir" && sha256sum --check "$(basename "$checksum_file")")
+              elif [ -e "$checksum_file" ]; then
+                # A checksum without its backup cannot prove that a complete
+                # pre-migration dump exists. Fail closed and keep it for
+                # operator inspection.
+                echo "Backup checksum exists without its backup" >&2
+                exit 1
+              else
+                test ! -e "$temporary_backup"
+                test ! -e "$temporary_checksum"
+                docker compose -p max-bot --env-file "$env_file" exec -T db \
+                  sh -c 'pg_dump --format=custom --username="$POSTGRES_USER" "$POSTGRES_DB"' | \
+                  openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 \
+                    -pass env:BACKUP_ENCRYPTION_PASSWORD -out "$temporary_backup"
+                test -s "$temporary_backup"
+                checksum="$(sha256sum "$temporary_backup" | awk '{print $1}')"
+                printf '%s  %s\n' "$checksum" "$(basename "$backup_file")" >"$temporary_checksum"
+                mv -n "$temporary_backup" "$backup_file"
+                mv -n "$temporary_checksum" "$checksum_file"
+                (cd "$backup_dir" && sha256sum --check "$(basename "$checksum_file")")
+              fi
+              trap - EXIT
+              cleanup_backup_temporaries
+            fi
+
+            wait_ready() {
+              attempt=1
+              while [ "$attempt" -le 30 ]; do
+                if curl --silent --show-error --fail --connect-timeout 2 --max-time 3 \
+                  http://127.0.0.1:8080/readyz >/dev/null; then
+                  return 0
+                fi
+                sleep 2
+                attempt=$((attempt + 1))
+              done
+              return 1
+            }
+
+            cd "$release_dir"
+            export SKILLGAP_IMAGE_TAG="${{ github.sha }}"
+            docker compose -p max-bot --env-file "$env_file" config --quiet
+            active_services="$(docker compose -p max-bot --env-file "$env_file" config --services)"
+            if ! grep -qx grafana <<<"$active_services" || ! grep -qx prometheus <<<"$active_services"; then
+              # Reconcile containers left by the legacy compose file where
+              # observability was mandatory and ports were publicly bound.
+              docker compose -p max-bot --env-file "$env_file" --profile observability \
+                stop prometheus grafana || true
+              docker compose -p max-bot --env-file "$env_file" --profile observability \
+                rm -f prometheus grafana || true
+            fi
+            docker compose -p max-bot --env-file "$env_file" up -d --no-build --remove-orphans
+
+            if ! wait_ready; then
+              docker compose -p max-bot --env-file "$env_file" logs --tail=100 app >&2 || true
+
+              if [ "$schema_changed" -eq 0 ] && [ -n "$previous_dir" ] && [ -f "$previous_dir/docker-compose.yml" ]; then
+                cd "$previous_dir"
+                if [ "$previous_dir" != /opt/max-bot ]; then
+                  export SKILLGAP_IMAGE_TAG="$(basename "$previous_dir")"
+                  docker compose -p max-bot --env-file "$env_file" up -d --no-build --remove-orphans
+                else
+                  docker compose -p max-bot --env-file "$env_file" up -d --build --remove-orphans
+                fi
+                if ! wait_ready; then
+                  docker compose -p max-bot --env-file "$env_file" logs --tail=100 app >&2 || true
+                  echo "Rollback was attempted, but the previous release did not become ready" >&2
+                  exit 1
+                fi
+                echo "Previous release is ready after rollback" >&2
+              elif [ "$schema_changed" -eq 1 ]; then
+                echo "Automatic application rollback skipped because migrations changed." >&2
+                if [ -n "$previous_dir" ]; then
+                  echo "An encrypted pre-migration backup was created." >&2
+                fi
+              fi
+
+              echo "New release did not become ready" >&2
+              exit 1
+            fi
+
+            ln -sfn "$release_dir" /opt/max-bot/current.next
+            mv -Tf /opt/max-bot/current.next /opt/max-bot/current
+            docker compose -p max-bot --env-file "$env_file" ps
+
+            backup_dir=/opt/max-bot/backups
+            if [ -d "$backup_dir" ]; then
+              test "$(readlink -f "$backup_dir")" = "$backup_dir"
+              find "$backup_dir" -maxdepth 1 -type f \
+                \( -name 'before-*.dump.enc' -o -name 'before-*.dump.enc.sha256' \) \
+                -mtime "+${retention_days}" -delete
+              # A SIGKILL cannot run the per-deploy EXIT trap. Remove only
+              # stale, uniquely named temporary files left by such a run.
+              find "$backup_dir" -maxdepth 1 -type f \
+                \( -name 'before-*.dump.enc.run-*.tmp' -o -name 'before-*.dump.enc.run-*.tmp.sha256' \) \
+                -mtime +1 -delete
+            fi
+            while IFS= read -r -d '' old_release; do
+              resolved="$(readlink -f "$old_release")"
+              case "$resolved" in
+                /opt/max-bot/releases/*)
+                  if [ "$resolved" != "$release_dir" ] && [ "$resolved" != "$previous_dir" ]; then
+                    rm -rf -- "$resolved"
+                  fi
+                  ;;
+                *) echo "Skipping unexpected release path: $resolved" >&2 ;;
+              esac
+            done < <(find "$release_root" -mindepth 1 -maxdepth 1 -type d -mtime "+${retention_days}" -print0)
+            docker image prune -af \
+              --filter 'label=org.opencontainers.image.title=SkillGap' \
+              --filter "until=${retention_hours}h"
+            SKILLGAP_DEPLOY

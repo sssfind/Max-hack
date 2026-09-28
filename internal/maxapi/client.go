@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"mime/multipart"
 	"net"
 	"net/http"
@@ -16,7 +15,6 @@ import (
 	"path"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -29,6 +27,7 @@ const (
 	globalLimitRPS                = rate.Limit(25) // docs recommend ≤30 rps to the platform
 	globalBurst                   = 10
 	maxHTTPAttempts               = 3
+	maxAPIResponseSize            = 4 << 20
 	maxFileUploadSize             = 20 << 20 // reports are small; cap memory and upload time at 20 MiB
 	maxUploadResponseSize         = 1 << 20
 	attachmentReadyAttempts       = 4
@@ -85,7 +84,7 @@ type Client struct {
 	baseURL    string
 	token      string
 	global     *rate.Limiter
-	limiters   sync.Map
+	limiters   *chatLimiterRegistry
 	waitFn     func(context.Context, time.Duration) error
 	lookupIP   func(context.Context, string) ([]net.IPAddr, error)
 }
@@ -109,6 +108,7 @@ func newClient(token, apiBaseURL string, httpClient *http.Client) *Client {
 		baseURL:    apiBaseURL,
 		token:      token,
 		global:     rate.NewLimiter(globalLimitRPS, globalBurst),
+		limiters:   newChatLimiterRegistry(defaultChatLimiterCapacity, defaultChatLimiterIdleTTL),
 		waitFn:     waitContext,
 		lookupIP:   net.DefaultResolver.LookupIPAddr,
 	}
@@ -132,15 +132,6 @@ func (c *Client) wait(ctx context.Context, delay time.Duration) error {
 	return waitContext(ctx, delay)
 }
 
-func (c *Client) getLimiter(chatID int64) *rate.Limiter {
-	if val, ok := c.limiters.Load(chatID); ok {
-		return val.(*rate.Limiter)
-	}
-	newLimiter := rate.NewLimiter(limitPerSec, burstCapacity)
-	actual, _ := c.limiters.LoadOrStore(chatID, newLimiter)
-	return actual.(*rate.Limiter)
-}
-
 func (c *Client) waitLimits(ctx context.Context, chatID int64) error {
 	if err := c.global.Wait(ctx); err != nil {
 		return fmt.Errorf("global rate limiter: %w", err)
@@ -148,8 +139,10 @@ func (c *Client) waitLimits(ctx context.Context, chatID int64) error {
 	if chatID == 0 {
 		return nil
 	}
-	if err := c.getLimiter(chatID).Wait(ctx); err != nil {
-		return fmt.Errorf("chat %d rate limiter: %w", chatID, err)
+	limiter, release := c.limiters.acquire(chatID)
+	defer release()
+	if err := limiter.Wait(ctx); err != nil {
+		return fmt.Errorf("per-chat rate limiter: %w", err)
 	}
 	return nil
 }
@@ -190,36 +183,42 @@ func (c *Client) doJSON(ctx context.Context, method, path string, query url.Valu
 		if err != nil {
 			lastErr = fmt.Errorf("network error: %w", err)
 			if retryableMethod && attempt < maxHTTPAttempts {
-				time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
+				if waitErr := c.wait(ctx, time.Duration(attempt)*200*time.Millisecond); waitErr != nil {
+					return errors.Join(lastErr, waitErr)
+				}
 				continue
 			}
 			return lastErr
 		}
 
-		respBody, readErr := io.ReadAll(resp.Body)
+		respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxAPIResponseSize+1))
 		_ = resp.Body.Close()
 		if readErr != nil {
 			return fmt.Errorf("read response: %w", readErr)
 		}
+		if len(respBody) > maxAPIResponseSize {
+			return fmt.Errorf("read response: body exceeds %d bytes", maxAPIResponseSize)
+		}
 
-		switch {
-		case resp.StatusCode == http.StatusOK:
+		if resp.StatusCode == http.StatusOK {
 			if out != nil && len(respBody) > 0 {
 				if err := json.Unmarshal(respBody, out); err != nil {
 					return fmt.Errorf("decode response: %w", err)
 				}
 			}
 			return nil
-		case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable:
+		}
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
 			lastErr = newAPIError(resp.StatusCode, respBody)
 			if retryableMethod && attempt < maxHTTPAttempts {
-				time.Sleep(time.Duration(attempt*attempt) * 300 * time.Millisecond)
+				if waitErr := c.wait(ctx, time.Duration(attempt*attempt)*300*time.Millisecond); waitErr != nil {
+					return errors.Join(lastErr, waitErr)
+				}
 				continue
 			}
 			return lastErr
-		default:
-			return newAPIError(resp.StatusCode, respBody)
 		}
+		return newAPIError(resp.StatusCode, respBody)
 	}
 	return lastErr
 }
@@ -243,6 +242,25 @@ type APIError struct {
 	Code       string `json:"code,omitempty"`
 	Err        string `json:"error,omitempty"`
 	Message    string `json:"message,omitempty"`
+}
+
+// IsRetryableDeliveryError classifies failures for a caller that has already
+// persisted the exact outbound request. Explicit client-side rejections are
+// terminal; network failures, cancellation/timeouts, throttling and 5xx
+// responses may be replayed from that durable receipt.
+func IsRetryableDeliveryError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.StatusCode == http.StatusRequestTimeout || apiErr.StatusCode == http.StatusTooManyRequests || apiErr.StatusCode >= 500
+	}
+	var networkErr net.Error
+	return errors.As(err, &networkErr)
 }
 
 func (e *APIError) Error() string {
@@ -303,8 +321,12 @@ func (c *Client) Subscribe(ctx context.Context, webhookURL, secret string, updat
 	if err != nil {
 		return err
 	}
-	if !result.Success && result.Message != "" {
-		return fmt.Errorf("subscribe failed: %s", result.Message)
+	if !result.Success {
+		message := strings.TrimSpace(result.Message)
+		if message == "" {
+			message = "MAX returned success=false"
+		}
+		return fmt.Errorf("subscribe failed: %s", message)
 	}
 	return nil
 }
@@ -654,8 +676,12 @@ func (c *Client) AnswerCallback(ctx context.Context, callbackID string, chatID i
 	if err := c.doJSON(ctx, http.MethodPost, "/answers", query, req, &result); err != nil {
 		return err
 	}
-	if !result.Success && result.Message != "" {
-		slog.Warn("callback answer returned unsuccessful", "message", result.Message, "callback_id", callbackID)
+	if !result.Success {
+		message := strings.TrimSpace(result.Message)
+		if message == "" {
+			message = "MAX returned success=false"
+		}
+		return fmt.Errorf("callback answer failed: %s", message)
 	}
 	return nil
 }

@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -81,7 +82,7 @@ func TestServiceAnalyzeDeduplicatesAndFiltersMarketResults(t *testing.T) {
 	if stats.VacancyCount != 2 || stats.EntryLevelCount != 2 {
 		t.Errorf("statistics = %+v", stats)
 	}
-	if snapshot.Mode != ModeLive || snapshot.Source != "Работа России (opendata.trudvsem.ru)" {
+	if snapshot.Mode != ModeTest || snapshot.Source == officialSourceName || !strings.Contains(snapshot.Source, "тестовый") {
 		t.Errorf("snapshot metadata = %+v", snapshot)
 	}
 	if want := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC); !snapshot.FetchedAt.Equal(want) {
@@ -135,6 +136,9 @@ func TestServiceAnalyzeReturnsPartialResultsAndWarnings(t *testing.T) {
 	}
 	if stats.VacancyCount != 1 {
 		t.Errorf("stats = %+v", stats)
+	}
+	if !snapshot.Partial {
+		t.Error("partial upstream result was not marked partial")
 	}
 	if !snapshot.FetchedAt.Equal(now) {
 		t.Errorf("FetchedAt = %v, want %v", snapshot.FetchedAt, now)
@@ -265,7 +269,7 @@ func TestServiceAnalyzeValidation(t *testing.T) {
 	}
 }
 
-func TestServiceSortsAndTruncatesFreshestVacancies(t *testing.T) {
+func TestServiceSortsAndTruncatesByRelevanceThenFreshness(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -285,7 +289,7 @@ func TestServiceSortsAndTruncatesFreshestVacancies(t *testing.T) {
 	if len(snapshot.Vacancies) != 2 || snapshot.Vacancies[0].ID != "new-a" || snapshot.Vacancies[1].ID != "new-b" {
 		t.Errorf("sorted/truncated vacancies = %#v", snapshot.Vacancies)
 	}
-	assertWarningContains(t, snapshot.Warnings, "2 наиболее свежих вакансий из полученной выборки")
+	assertWarningContains(t, snapshot.Warnings, "2 наиболее релевантных вакансий из полученной выборки")
 }
 
 func TestEntryLevelAndRelevanceRules(t *testing.T) {
@@ -322,12 +326,13 @@ func TestEntryLevelAndRelevanceRules(t *testing.T) {
 		want  bool
 	}{
 		{name: "title", item: Vacancy{Title: "Golang developer"}, query: "golang", want: true},
-		{name: "requirements", item: Vacancy{Requirements: "Нужен Python"}, query: "python", want: true},
-		{name: "duties", item: Vacancy{Duties: "Работа с PostgreSQL"}, query: "postgresql", want: true},
+		{name: "requirements only is weak evidence", item: Vacancy{Requirements: "Нужен Python"}, query: "python"},
+		{name: "duties only is weak evidence", item: Vacancy{Duties: "Работа с PostgreSQL"}, query: "postgresql"},
 		{name: "skill", item: Vacancy{Skills: []Skill{{Name: "Docker"}}}, query: "docker", want: true},
 		{name: "one meaningful term", item: Vacancy{Title: "Backend developer"}, query: "golang backend", want: true},
+		{name: "generic role word is insufficient", item: Vacancy{Title: "Специалист по продажам"}, query: "специалист по информационным системам", want: false},
 		{name: "irrelevant", item: Vacancy{Title: "Бухгалтер"}, query: "golang backend"},
-		{name: "only stop words", item: Vacancy{Title: "Любая"}, query: "работа для техник оператор", want: true},
+		{name: "only stop words", item: Vacancy{Title: "Любая"}, query: "работа для без опыта junior"},
 	}
 	for _, tt := range relevanceTests {
 		t.Run("relevance/"+tt.name, func(t *testing.T) {
@@ -335,6 +340,164 @@ func TestEntryLevelAndRelevanceRules(t *testing.T) {
 				t.Errorf("isRelevant(%+v, %q) = %v, want %v", tt.item, tt.query, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestServiceFiltersHigherEducationAndReportsSamplingStages(t *testing.T) {
+	t.Parallel()
+
+	zero := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeTestVacancies(t, w,
+			testAPIVacancy{ID: "higher", Title: "Программист", Education: "Высшее образование — бакалавриат", Experience: &zero},
+			testAPIVacancy{ID: "spo", Title: "Программист", Education: "Среднее профессиональное образование", Experience: &zero},
+		)
+	}))
+	t.Cleanup(server.Close)
+
+	service := NewService(mustTestClient(t, server, 1<<20), ServiceOptions{DisableCache: true})
+	snapshot, stats, err := service.Analyze(context.Background(), SearchRequest{RegionCode: "77", Queries: []string{"программист"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Vacancies) != 1 || snapshot.Vacancies[0].ID != "spo" || stats.VacancyCount != 1 {
+		t.Fatalf("education filter result = %#v, stats=%+v", snapshot.Vacancies, stats)
+	}
+	want := SamplingStages{SourceTotal: 2, Retrieved: 2, EntryLevelPassed: 2, EducationPassed: 1, RelevantPassed: 1, RejectedHigherEducation: 1, Deduplicated: 1, Included: 1}
+	if snapshot.Sampling != want {
+		t.Errorf("sampling = %+v, want %+v", snapshot.Sampling, want)
+	}
+	assertWarningContains(t, snapshot.Warnings, "обязательным высшим образованием: 1")
+}
+
+func TestEducationClassifierAllowsSPOAlternative(t *testing.T) {
+	t.Parallel()
+
+	if got := classifyEducation(Vacancy{Education: "Высшее или среднее профессиональное образование"}); got != EducationHigherOrVocational {
+		t.Errorf("mixed education = %q", got)
+	}
+	if got := classifyEducation(Vacancy{Requirements: "Требуется высшее техническое образование"}); got != EducationHigherOnly {
+		t.Errorf("higher-only education = %q", got)
+	}
+	if got := classifyEducation(Vacancy{Education: "Образование не требуется"}); got != EducationNotRequired {
+		t.Errorf("not-required education = %q", got)
+	}
+}
+
+func TestServiceCacheFreshHitAndStaleFallback(t *testing.T) {
+	t.Parallel()
+
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if hits.Add(1) > 1 {
+			http.Error(w, "unavailable", http.StatusBadGateway)
+			return
+		}
+		writeTestVacancies(t, w, testAPIVacancy{ID: "one", Title: "Developer"})
+	}))
+	t.Cleanup(server.Close)
+
+	now := time.Date(2026, 9, 27, 10, 0, 0, 0, time.UTC)
+	service := NewService(mustTestClient(t, server, 1<<20), ServiceOptions{
+		CacheTTL:      time.Minute,
+		StaleCacheTTL: time.Hour,
+		Now:           func() time.Time { return now },
+	})
+	req := SearchRequest{RegionCode: "77", ProgramCode: "09.02.07", Queries: []string{"developer"}}
+	first, _, err := service.Analyze(context.Background(), req)
+	if err != nil || first.Mode != ModeTest {
+		t.Fatalf("first analyze = mode %q, err %v", first.Mode, err)
+	}
+	fresh, _, err := service.Analyze(context.Background(), req)
+	if err != nil || fresh.Mode != ModeTest || hits.Load() != 1 {
+		t.Fatalf("fresh cache = mode %q, hits %d, err %v", fresh.Mode, hits.Load(), err)
+	}
+	now = now.Add(2 * time.Minute)
+	stale, _, err := service.Analyze(context.Background(), req)
+	if err != nil || stale.Mode != ModeTest || hits.Load() != 3 { // one request plus one retry
+		t.Fatalf("stale fallback = mode %q, hits %d, err %v", stale.Mode, hits.Load(), err)
+	}
+	assertWarningContains(t, stale.Warnings, "Настраиваемый тестовый источник временно недоступен")
+}
+
+func TestServiceCacheHonorsByteBudget(t *testing.T) {
+	t.Parallel()
+
+	service := NewService(&Client{}, ServiceOptions{
+		CacheMaxEntries: 10,
+		CacheMaxBytes:   3 << 10,
+		StaleCacheTTL:   time.Hour,
+	})
+	now := time.Now().UTC()
+	small := Snapshot{Source: officialSourceName, Mode: ModeLive, Vacancies: []Vacancy{{ID: "1", Title: "Developer"}}}
+	service.storeCache("one", small, Statistics{}, now)
+	service.storeCache("two", small, Statistics{}, now.Add(time.Second))
+
+	service.cacheMu.RLock()
+	if len(service.cache) != 1 {
+		t.Errorf("cache entries = %d, want oldest entry evicted", len(service.cache))
+	}
+	if _, ok := service.cache["two"]; !ok {
+		t.Error("newest entry was not retained")
+	}
+	if service.cacheBytes > service.opts.CacheMaxBytes {
+		t.Errorf("cache bytes = %d, budget = %d", service.cacheBytes, service.opts.CacheMaxBytes)
+	}
+	service.cacheMu.RUnlock()
+
+	oversized := small
+	oversized.Vacancies[0].Requirements = strings.Repeat("x", 8<<10)
+	service.storeCache("oversized", oversized, Statistics{}, now.Add(2*time.Second))
+	service.cacheMu.RLock()
+	_, cached := service.cache["oversized"]
+	service.cacheMu.RUnlock()
+	if cached {
+		t.Error("single entry larger than byte budget was cached")
+	}
+}
+
+func TestCachedOfficialSnapshotUsesCacheMode(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	service := NewService(&Client{}, ServiceOptions{CacheTTL: time.Minute})
+	service.storeCache("official", Snapshot{Source: officialSourceName, Mode: ModeLive}, Statistics{}, now)
+	got, _, ok := service.cached("official", now, time.Minute, false)
+	if !ok || got.Mode != ModeCache {
+		t.Fatalf("official cache mode = %q, ok=%v", got.Mode, ok)
+	}
+}
+
+func TestSourceTotalSaturatesInsteadOfOverflowing(t *testing.T) {
+	t.Parallel()
+
+	maxInt := int(^uint(0) >> 1)
+	if got := saturatingSourceTotal(maxInt-1, 10); got != maxInt {
+		t.Errorf("saturated total = %d, want %d", got, maxInt)
+	}
+	if got := saturatingSourceTotal(5, -1); got != 5 {
+		t.Errorf("negative source total changed count to %d", got)
+	}
+}
+
+func TestServiceRanksTitleMatchAboveSkillOnlyMatch(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeTestVacancies(t, w,
+			testAPIVacancy{ID: "skill", Title: "Оператор", Skills: []string{"Docker"}, Published: "2026-09-27"},
+			testAPIVacancy{ID: "title", Title: "Docker инженер", Published: "2026-09-20"},
+		)
+	}))
+	t.Cleanup(server.Close)
+
+	service := NewService(mustTestClient(t, server, 1<<20), ServiceOptions{DisableCache: true})
+	snapshot, _, err := service.Analyze(context.Background(), SearchRequest{RegionCode: "77", Queries: []string{"docker"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Vacancies) != 2 || snapshot.Vacancies[0].ID != "title" || snapshot.Vacancies[0].RelevanceScore <= snapshot.Vacancies[1].RelevanceScore {
+		t.Fatalf("ranking = %#v", snapshot.Vacancies)
 	}
 }
 
@@ -394,6 +557,19 @@ func TestDeduplicateDoesNotInventRangeFromPartialSalaryRecords(t *testing.T) {
 	}
 }
 
+func TestDeduplicateKeepsSalaryTextWithSelectedRecord(t *testing.T) {
+	t.Parallel()
+
+	from := int64(80_000)
+	got := deduplicate([]Vacancy{
+		{ID: "same", SalaryText: "по договорённости"},
+		{ID: "same", SalaryFrom: &from, Currency: "RUB", SalaryText: "от 80 000 рублей"},
+	})
+	if len(got) != 1 || got[0].SalaryFrom == nil || got[0].SalaryText != "от 80 000 рублей" || got[0].Currency != "RUB" {
+		t.Fatalf("merged salary record = %+v", got)
+	}
+}
+
 func TestUniqueQueriesTrimsDeduplicatesAndLimits(t *testing.T) {
 	t.Parallel()
 
@@ -415,6 +591,7 @@ type testAPIVacancy struct {
 	Employer     string
 	Requirements string
 	Duties       string
+	Education    string
 	Experience   *int
 	Skills       []string
 	Published    string
@@ -427,6 +604,9 @@ func writeTestVacancies(t *testing.T, w http.ResponseWriter, items ...testAPIVac
 		requirement := make(map[string]any)
 		if item.Experience != nil {
 			requirement["experience"] = *item.Experience
+		}
+		if item.Education != "" {
+			requirement["education"] = item.Education
 		}
 		wrapped = append(wrapped, map[string]any{
 			"vacancy": map[string]any{

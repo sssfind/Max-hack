@@ -43,6 +43,26 @@ var textSkillPatterns = []skillPattern{
 	newSkillPattern("Коммуникация", nil, []string{"коммуникабель", "коммуникатив"}),
 	newSkillPattern("Медицинская документация", nil, []string{"медицинской документац", "медицинскую документац"}),
 	newSkillPattern("ГОСТ", []string{"гост"}, nil),
+	newSkillPattern("CRM", []string{"crm", "битрикс24", "amoCRM"}, nil),
+	newSkillPattern("Adobe Photoshop", []string{"photoshop", "фотошоп"}, nil),
+	newSkillPattern("Figma", []string{"figma"}, nil),
+	newSkillPattern("BIM/Revit", []string{"bim", "revit"}, nil),
+	newSkillPattern("Электромонтаж", nil, []string{"электромонтаж"}),
+	newSkillPattern("Техническое обслуживание оборудования", nil, []string{"техническое обслуживание оборудован"}),
+	newSkillPattern("Ремонт оборудования", nil, []string{"ремонт оборудован"}),
+	newSkillPattern("Диагностика оборудования", nil, []string{"диагностик оборудован"}),
+	newSkillPattern("Измерительные инструменты", nil, []string{"измерительн инструмент", "контрольно измерительн"}),
+	newSkillPattern("Складской учет", []string{"складской учет", "складской учёт"}, nil),
+	newSkillPattern("Логистика", nil, []string{"логистик"}),
+	newSkillPattern("Кассовые операции", nil, []string{"кассовых операц", "кассовые операц"}),
+	newSkillPattern("Налоговая отчетность", nil, []string{"налоговой отчетност", "налоговой отчётност"}),
+	newSkillPattern("Первая помощь", []string{"первая помощь", "первой помощи"}, nil),
+	newSkillPattern("Сестринский уход", nil, []string{"сестринск уход"}),
+	newSkillPattern("Санитарные нормы", nil, []string{"санитарн норм", "санпин"}),
+	newSkillPattern("Приготовление блюд", nil, []string{"приготовлен блюд", "приготовлен пищ"}),
+	newSkillPattern("Контроль качества", []string{"контроль качества"}, nil),
+	newSkillPattern("Проектная документация", nil, []string{"проектной документац", "проектную документац"}),
+	newSkillPattern("Документооборот", nil, []string{"документооборот"}),
 }
 
 func newSkillPattern(name string, exact, prefixes []string) skillPattern {
@@ -57,20 +77,43 @@ func newSkillPattern(name string, exact, prefixes []string) skillPattern {
 }
 
 func compileSkillMarker(marker string, prefix bool) *regexp.Regexp {
-	expression := `(?i)(^|[^\p{L}\p{N}])` + regexp.QuoteMeta(strings.TrimSpace(marker))
+	marker = strings.TrimSpace(marker)
+	expression := `(?i)(^|[^\p{L}\p{N}])`
 	if prefix {
-		expression += `[\p{L}\p{N}]*`
+		parts := strings.Fields(marker)
+		for index, part := range parts {
+			if index > 0 {
+				expression += `\s+`
+			}
+			expression += regexp.QuoteMeta(part) + `[\p{L}\p{N}]*`
+		}
 	} else {
+		expression += regexp.QuoteMeta(marker)
 		expression += `($|[^\p{L}\p{N}])`
 	}
 	return regexp.MustCompile(expression)
 }
 
 func collectSkills(structured []string, text string) []Skill {
-	result := make([]Skill, 0, len(structured)+4)
-	seen := make(map[string]struct{}, len(structured)+4)
+	return collectSkillsFromFields(structured, "", text, "")
+}
+
+type skillTextField struct {
+	name  string
+	value string
+}
+
+func collectSkillsFromFields(structured []string, qualification, requirements, duties string) []Skill {
+	capacity := min(len(structured)+4, maxVacancySkills)
+	result := make([]Skill, 0, capacity)
+	seen := make(map[string]struct{}, capacity)
 	for _, value := range structured {
-		name := cleanText(value)
+		if len(result) >= maxVacancySkills {
+			break
+		}
+		rawName := cleanTextBounded(value, maxSkillNameBytes)
+		name := canonicalSkillName(rawName)
+		name = truncateUTF8Bytes(name, maxSkillNameBytes)
 		key := normalizeSkillKey(name)
 		if key == "" {
 			continue
@@ -79,19 +122,39 @@ func collectSkills(structured []string, text string) []Skill {
 			continue
 		}
 		seen[key] = struct{}{}
-		result = append(result, Skill{Name: name, Evidence: "структурированное поле вакансии"})
+		result = append(result, Skill{
+			Name:            name,
+			Evidence:        "структурированное поле вакансии",
+			EvidenceField:   "skills",
+			EvidenceExcerpt: rawName,
+		})
 	}
 
-	normalizedText := cleanText(text)
+	fields := []skillTextField{
+		{name: "qualification", value: cleanTextBounded(qualification, maxDescriptionBytes)},
+		{name: "requirements", value: cleanTextBounded(requirements, maxDescriptionBytes)},
+		{name: "duties", value: cleanTextBounded(duties, maxDescriptionBytes)},
+	}
 	for _, pattern := range textSkillPatterns {
-		matched := false
-		for _, marker := range pattern.markers {
-			if marker.MatchString(normalizedText) {
-				matched = true
+		if len(result) >= maxVacancySkills {
+			break
+		}
+		var evidenceField, evidenceExcerpt string
+		for _, field := range fields {
+			for _, marker := range pattern.markers {
+				location := marker.FindStringIndex(field.value)
+				if location == nil {
+					continue
+				}
+				evidenceField = field.name
+				evidenceExcerpt = evidenceWindow(field.value, location[0], location[1])
+				break
+			}
+			if evidenceField != "" {
 				break
 			}
 		}
-		if !matched {
+		if evidenceField == "" {
 			continue
 		}
 		key := normalizeSkillKey(pattern.name)
@@ -99,33 +162,108 @@ func collectSkills(structured []string, text string) []Skill {
 			continue
 		}
 		seen[key] = struct{}{}
-		result = append(result, Skill{Name: pattern.name, Evidence: "из текста требований"})
+		result = append(result, Skill{
+			Name:            pattern.name,
+			Evidence:        "из текста требований",
+			EvidenceField:   evidenceField,
+			EvidenceExcerpt: evidenceExcerpt,
+		})
 	}
 	return result
 }
 
+func evidenceWindow(text string, start, end int) string {
+	if text == "" {
+		return ""
+	}
+	runes := []rune(text)
+	startRune := len([]rune(text[:max(0, start)]))
+	endRune := len([]rune(text[:min(len(text), end)]))
+	const contextRunes = 45
+	from := max(0, startRune-contextRunes)
+	to := min(len(runes), endRune+contextRunes)
+	excerpt := strings.TrimSpace(string(runes[from:to]))
+	if from > 0 {
+		excerpt = "…" + excerpt
+	}
+	if to < len(runes) {
+		excerpt += "…"
+	}
+	return excerpt
+}
+
+func canonicalSkillName(value string) string {
+	value = cleanText(value)
+	key := rawSkillKey(value)
+	switch key {
+	case "1c", "1с", "1с предприятие", "1c enterprise":
+		return "1С"
+	case "excel", "эксель", "ms excel", "microsoft excel":
+		return "Microsoft Excel"
+	case "postgres", "postgresql", "mysql", "ms sql", "mssql", "microsoft sql server", "sql":
+		return "SQL"
+	case "golang", "go":
+		return "Go"
+	case "js", "javascript", "node js", "node.js":
+		return "JavaScript"
+	case "gitlab", "github", "git":
+		return "Git"
+	case "k8s", "kubernetes":
+		return "Kubernetes"
+	case "английский", "английский язык", "english":
+		return "Английский язык"
+	case "работа в команде", "командная работа":
+		return "Командная работа"
+	case "crm", "amocrm", "битрикс24", "bitrix24":
+		return "CRM"
+	case "photoshop", "adobe photoshop", "фотошоп":
+		return "Adobe Photoshop"
+	case "figma":
+		return "Figma"
+	case "autocad", "автокад":
+		return "AutoCAD"
+	default:
+		return value
+	}
+}
+
 func mergeSkills(left, right []Skill) []Skill {
+	if len(left) > maxVacancySkills {
+		left = left[:maxVacancySkills]
+	}
 	result := append([]Skill(nil), left...)
-	seen := make(map[string]struct{}, len(left)+len(right))
-	for _, skill := range left {
-		seen[normalizeSkillKey(skill.Name)] = struct{}{}
+	positions := make(map[string]int, len(left)+len(right))
+	for index, skill := range left {
+		positions[normalizeSkillKey(skill.Name)] = index
 	}
 	for _, skill := range right {
 		key := normalizeSkillKey(skill.Name)
 		if key == "" {
 			continue
 		}
-		if _, exists := seen[key]; exists {
+		if position, exists := positions[key]; exists {
+			if result[position].EvidenceField != "skills" && skill.EvidenceField == "skills" {
+				result[position] = skill
+			}
 			continue
 		}
-		seen[key] = struct{}{}
+		if len(result) >= maxVacancySkills {
+			continue
+		}
+		positions[key] = len(result)
 		result = append(result, skill)
 	}
 	return result
 }
 
 func normalizeSkillKey(value string) string {
-	return strings.ToLower(strings.Join(strings.Fields(value), " "))
+	return rawSkillKey(canonicalSkillName(value))
+}
+
+func rawSkillKey(value string) string {
+	value = strings.ToLower(strings.Join(strings.Fields(value), " "))
+	value = strings.NewReplacer("ё", "е", "–", "-", "—", "-").Replace(value)
+	return value
 }
 
 func topSkillFrequencies(items []Vacancy, limit int) []SkillFrequency {

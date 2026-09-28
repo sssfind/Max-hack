@@ -25,13 +25,14 @@
 | `internal/bot` | Сценарий диалога и сессия по `chat_id` |
 | `internal/catalog` | Справочник СПО и регионы |
 | `internal/vacancies` | Клиент «Работы России», нормализация, фильтрация и статистика рынка |
+| `internal/skillgap` | Безопасная загрузка и анализ федеральных ПОП/ФГОС, доказательства совпадений |
 | `internal/pdfreport` | PDF-отчёт по выбранной программе и найденным вакансиям |
 | `cmd/migrator` | Goose-миграции Postgres |
 | `cmd/emulator` | Нагрузка и повтор webhook, не пользовательский сценарий |
 
-Живые HTTP-маршруты: `POST /webhook`, `GET /metrics`. `shared/api/openapi.yaml` описывает несуществующий клиентский API и контуром SkillGap не является.
+Живые HTTP-маршруты: `POST /webhook`, `GET /healthz`, `GET /readyz`, `GET /metrics`. Отдельного клиентского HTTP API нет.
 
-Сейчас реализованы выбор направления и асинхронный анализ стартовых вакансий «Работы России»: статистика приходит сообщением, карточки вакансий с навыками, зарплатой и прямыми ссылками — PDF-файлом. Навыки извлекаются только из самой вакансии. Разбора ФГОС/ПОП и сопоставления навыков с образовательной программой (полного Skill Gap) пока нет.
+Сейчас реализованы выбор направления, асинхронный анализ стартовых вакансий «Работы России» и автоматическое сопоставление частых навыков с утверждённой федеральной ПОП или действующим ФГОС. Статистика приходит сообщением, карточки вакансий и полный Skill Gap — PDF-файлом. Навыки рынка извлекаются только из вакансий. Учебные планы конкретных колледжей не анализируются.
 
 ## MAX
 
@@ -43,29 +44,33 @@
 - Production — webhook, не long polling. `MAX_WEBHOOK_URL` только `https://`.
 - Секрет webhook — заголовок `X-Max-Bot-Api-Secret` (`internal/handler/middleware.go`).
 - Сессия ключуется по `chat_id`. В `message_created` `user_id` часто пустой; `chat_id` брать через `Update.ResolvedChatID` (`message.recipient.chat_id`).
+- Навигационное состояние сохраняется в `bot_sessions` с TTL. Очередь длительного анализа остаётся в памяти; после рестарта выбор восстанавливается, а прерванный анализ пользователь запускает повторно.
 - Лимиты клиента: 25 rps глобально, 2 сообщения в секунду на чат. Дока платформы — не больше 30 rps.
 - `GET /chats` не использовать.
 - Ответ на inline-кнопку — `POST /answers` с `callback_id`, не второй `POST /messages`.
 
-Callback-префиксы: `sg:begin`, `sg:help`, `sg:restart`, `sg:reg:`, `sg:p:`, `sg:q:`, `sg:analyze`. Подпись кнопки обрезать до 58 символов. В одном ряду callback-кнопок не больше 7 (у `link` — не больше 3). Клавиатура — до 30 рядов и 210 кнопок.
+Callback-префиксы: `sg:begin`, `sg:help`, `sg:restart`, `sg:reg:`, `sg:p:`, `sg:q:`, `sg:more:`, `sg:change:program`, `sg:change:region`, `sg:analyze:`, `sg:cancel:`, `sg:feedback:`. Подпись кнопки обрезать до 58 символов. В одном ряду callback-кнопок не больше 7 (у `link` — не больше 3). Клавиатура — до 30 рядов и 210 кнопок.
 
 Подписка при старте, если задан `MAX_WEBHOOK_URL`: `bot_started`, `bot_added`, `bot_removed`, `bot_stopped`, `message_created`, `message_callback`.
 
 ## Каталог и окружение
 
 - Путь справочника: `SKILLGAP_CATALOG_PATH`, иначе `spo_program_vacancy_map.json`.
+- Политика справочника: `SKILLGAP_CATALOG_POLICY=all|current|pilot`. Безопасное production-значение по умолчанию — `pilot`; неизвестное значение также должно закрываться до `pilot`. В `all` непроверенные модели явно помечать.
 - Регионы — коды «Работа России» в `internal/catalog/regions.go`. Быстрые кнопки — `PopularRegions`.
-- Обязательные переменные процесса: `DATABASE_URL`, `MAX_BOT_TOKEN`, `MAX_WEBHOOK_SECRET`. Шаблон — `core.env.template`. Секреты не коммитить.
+- Обязательные переменные процесса: `DATABASE_URL`, `MAX_BOT_TOKEN`, `MAX_WEBHOOK_SECRET`. Шаблон — `.env.example`. Секреты не коммитить.
+- Федеральные документы загружать только через `internal/skillgap`: HTTPS allowlist, лимиты download/archive/pages и проверка redirect обязательны. Утверждённая ПОП приоритетнее ФГОС; проект ПОП источником не считать.
 - Образ ставит корневые сертификаты Минцифры: без них `GET /me` к платформе не проходит.
 
 ## Как менять диалог
 
 Новый шаг сценария добавлять в `internal/bot`: состояние в `session.go`, переход в `handler.go`, payload с префиксом `sg:`. Текст пользователю — на русском, коротко, с явным шагом. Поиск программ: точный код важнее подстроки названия, актуальные (`is_current`) выше исторических.
 
-Анализ рынка не встраивать в handler напрямую. Источник и расчёты находятся в `internal/vacancies`, PDF — в `internal/pdfreport`; handler только управляет сценарием. Следующий отдельный слой — разбор программы и Skill Gap из `docs/architecture.md`.
+Анализ рынка не встраивать в handler напрямую. Источник и расчёты находятся в `internal/vacancies`, анализ федерального документа — в `internal/skillgap`, PDF — в `internal/pdfreport`; handler только управляет сценарием.
 
 ## Проверки
 
 - `task test` — юнит-тесты.
 - `task lint` — golangci-lint.
+- `task verify` — полный набор проверок, включая race/coverage, уязвимости и сборку.
 - `task up` / `task down` — docker compose.

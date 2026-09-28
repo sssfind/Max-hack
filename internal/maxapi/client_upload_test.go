@@ -384,6 +384,21 @@ func TestUploadFileRejectsOversizeBeforeNetwork(t *testing.T) {
 	}
 }
 
+func TestAPIResponseSizeIsBounded(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, strings.Repeat("x", maxAPIResponseSize+1))
+	}))
+	defer server.Close()
+
+	client := newClient("token", server.URL, server.Client())
+	_, err := client.GetMe(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("GetMe() error = %v, want response size limit error", err)
+	}
+}
+
 func TestFileAttachment(t *testing.T) {
 	t.Parallel()
 

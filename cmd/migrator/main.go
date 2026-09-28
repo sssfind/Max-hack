@@ -25,7 +25,11 @@ func main() {
 		slog.Error("Failed to open db for migrations", "error", err)
 		os.Exit(1)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			slog.Warn("Failed to close migration database", "error", err)
+		}
+	}()
 
 	if err := db.Ping(); err != nil {
 		slog.Error("Database is unreachable", "error", err)

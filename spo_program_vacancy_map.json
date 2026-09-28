@@ -8898,8 +8898,7 @@
       "ugps": "13.00.00 ЭЛЕКТРО- И ТЕПЛОЭНЕРГЕТИКА",
       "is_current": true,
       "qualifications": [
-        "Техник-электромонтажник",
-        "Техник- электромонтажник"
+        "Техник-электромонтажник"
       ],
       "work_roles": [
         {
@@ -8910,20 +8909,10 @@
           ],
           "query_confidence": "medium",
           "review_status": "requires_manual_review"
-        },
-        {
-          "canonical_title": "Техник- электромонтажник",
-          "source_basis": "official_qualification",
-          "vacancy_queries": [
-            "Техник- электромонтажник"
-          ],
-          "query_confidence": "medium",
-          "review_status": "requires_manual_review"
         }
       ],
       "vacancy_queries": [
-        "Техник-электромонтажник",
-        "Техник- электромонтажник"
+        "Техник-электромонтажник"
       ],
       "requires_manual_review": true,
       "active_standard": {
@@ -32184,7 +32173,7 @@
         "fgos_requisites": "от 14 ноября 2023 г. № 856",
         "fgos_year": 2023,
         "fgos_status": "принят",
-        "fgos_url": "https://spo-lab.ru/npdv2/category-doc/get/4044",
+        "fgos_url": "https://spolab.firpo.ru/npdv2/category-doc/get/4044",
         "pop_status": "проект",
         "pop_url": "https://spolab.firpo.ru/npdv2/category-doc/get/4324",
         "admission_ends": "нет",
@@ -32200,7 +32189,7 @@
           "fgos_requisites": "от 14 ноября 2023 г. № 856",
           "fgos_year": 2023,
           "fgos_status": "принят",
-          "fgos_url": "https://spo-lab.ru/npdv2/category-doc/get/4044",
+          "fgos_url": "https://spolab.firpo.ru/npdv2/category-doc/get/4044",
           "pop_status": "проект",
           "pop_url": "https://spolab.firpo.ru/npdv2/category-doc/get/4324",
           "admission_ends": "нет",

@@ -5,8 +5,13 @@ import (
 	"strings"
 )
 
+const MinimumSalarySample = 5
+
 func CalculateStatistics(items []Vacancy) Statistics {
-	stats := Statistics{VacancyCount: len(items)}
+	stats := Statistics{
+		VacancyCount: len(items),
+		SalaryMethod: "Для диапазона используется его середина; для односторонней вилки — опубликованная граница. Валюты не смешиваются; агрегаты показываются минимум по 5 вакансиям. До/после налогов и период выплаты не преобразуются.",
+	}
 	if len(items) == 0 {
 		stats.SmallSample = true
 		return stats
@@ -24,33 +29,38 @@ func CalculateStatistics(items []Vacancy) Statistics {
 		if employer != "" {
 			employers[employer] = struct{}{}
 		}
-		if item.ExperienceYears == nil || *item.ExperienceYears <= 1 {
+		if item.ExperienceYears == nil {
+			stats.ExperienceUnknownCount++
+		} else if *item.ExperienceYears <= 1 {
 			stats.EntryLevelCount++
+			if *item.ExperienceYears == 0 {
+				stats.NoExperienceCount++
+			}
 		}
 		if isRemote(item) {
 			stats.RemoteCount++
 		}
 		if salaryObservation(item) > 0 {
 			stats.SalaryCount++
-			currency := item.Currency
+			currency := strings.TrimSpace(item.Currency)
 			if currency == "" {
-				currency = "RUB"
+				stats.SalaryUnknownCurrencyCount++
+				continue
 			}
 			currencyCounts[currency]++
 		}
 	}
 	stats.EmployerCount = len(employers)
 	stats.EntryLevelPercent = percent(stats.EntryLevelCount, len(items))
+	stats.NoExperiencePercent = percent(stats.NoExperienceCount, len(items))
+	stats.ExperienceUnknownPercent = percent(stats.ExperienceUnknownCount, len(items))
 	stats.RemotePercent = percent(stats.RemoteCount, len(items))
 	stats.Currency = dominantCurrency(currencyCounts)
 
 	var observations []int64
 	for _, item := range items {
-		currency := item.Currency
-		if currency == "" {
-			currency = "RUB"
-		}
-		if currency != stats.Currency {
+		currency := strings.TrimSpace(item.Currency)
+		if stats.Currency == "" || currency == "" || currency != stats.Currency {
 			continue
 		}
 		observation := salaryObservation(item)
@@ -58,40 +68,50 @@ func CalculateStatistics(items []Vacancy) Statistics {
 			continue
 		}
 		observations = append(observations, observation)
-		for _, boundary := range []*int64{item.SalaryFrom, item.SalaryTo} {
-			if boundary == nil || *boundary <= 0 {
-				continue
-			}
-			if stats.SalaryMin == nil || *boundary < *stats.SalaryMin {
-				value := *boundary
-				stats.SalaryMin = &value
-			}
-			if stats.SalaryMax == nil || *boundary > *stats.SalaryMax {
-				value := *boundary
-				stats.SalaryMax = &value
-			}
-		}
 	}
 	stats.SalarySampleCount = len(observations)
 	stats.SalaryCoveragePercent = percent(stats.SalaryCount, len(items))
-	if len(observations) > 0 {
+	stats.SalaryReliable = len(observations) >= MinimumSalarySample
+	if stats.SalaryReliable {
 		sort.Slice(observations, func(i, j int) bool { return observations[i] < observations[j] })
 		middle := len(observations) / 2
 		median := observations[middle]
 		if len(observations)%2 == 0 {
-			median = (observations[middle-1] + observations[middle]) / 2
+			median = observations[middle-1] + (observations[middle]-observations[middle-1])/2
 		}
 		stats.SalaryMedian = &median
+		for _, item := range items {
+			if strings.TrimSpace(item.Currency) != stats.Currency || salaryObservation(item) <= 0 {
+				continue
+			}
+			for _, boundary := range []*int64{item.SalaryFrom, item.SalaryTo} {
+				if boundary == nil || *boundary <= 0 {
+					continue
+				}
+				if stats.SalaryMin == nil || *boundary < *stats.SalaryMin {
+					value := *boundary
+					stats.SalaryMin = &value
+				}
+				if stats.SalaryMax == nil || *boundary > *stats.SalaryMax {
+					value := *boundary
+					stats.SalaryMax = &value
+				}
+			}
+		}
 	}
 	stats.TopSkills = topSkillFrequencies(items, 8)
-	stats.SmallSample = len(items) < 5 || stats.SalarySampleCount < 5
+	stats.SmallSample = len(items) < 5 || !stats.SalaryReliable
 	return stats
 }
 
 func salaryObservation(item Vacancy) int64 {
 	switch {
 	case item.SalaryFrom != nil && item.SalaryTo != nil && *item.SalaryFrom > 0 && *item.SalaryTo > 0:
-		return (*item.SalaryFrom + *item.SalaryTo) / 2
+		lower, upper := *item.SalaryFrom, *item.SalaryTo
+		if lower > upper {
+			return 0
+		}
+		return lower + (upper-lower)/2
 	case item.SalaryFrom != nil && *item.SalaryFrom > 0:
 		return *item.SalaryFrom
 	case item.SalaryTo != nil && *item.SalaryTo > 0:
@@ -102,7 +122,7 @@ func salaryObservation(item Vacancy) int64 {
 }
 
 func dominantCurrency(counts map[string]int) string {
-	result := "RUB"
+	result := ""
 	maxCount := 0
 	for currency, count := range counts {
 		if count > maxCount || count == maxCount && currency < result {

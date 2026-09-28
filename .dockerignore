@@ -1,0 +1,45 @@
+# VCS and editors
+.git
+.github
+.gitignore
+.idea
+.cursor
+.vscode
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+
+# Build and test output
+bin/
+.task/
+build/
+dist/
+coverage/
+tmp/
+*.cover
+*.out
+*.log
+*.prof
+**/*_test.go
+
+# Material that is not needed in the runtime image
+docs/
+deploy/
+дока макса/
+schemas/
+shared/
+*.md
+*.pdf
+Taskfile.yml
+docker-compose*.yml
+nginx.conf
+prometheus.yml
+
+# OS metadata
+.DS_Store
+Thumbs.db

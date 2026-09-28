@@ -79,7 +79,11 @@ func sendWebhook(client *http.Client, update Update) {
 		log.Printf("Network error: %v", err)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("Error closing response body: %v", err)
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("Warning! expected 200 OK, received: %d", resp.StatusCode)

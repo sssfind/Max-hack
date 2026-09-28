@@ -1,6 +1,9 @@
 package vacancies
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
 
 func TestCalculateStatisticsMedianRangesCoverageAndMarketCounts(t *testing.T) {
 	t.Parallel()
@@ -34,6 +37,7 @@ func TestCalculateStatisticsMedianRangesCoverageAndMarketCounts(t *testing.T) {
 			Employer:   "Employer C",
 			SalaryFrom: salaryValue(80000),
 			SalaryTo:   salaryValue(100000),
+			Currency:   "RUB",
 			Skills:     []Skill{{Name: "Go"}},
 		},
 		{
@@ -65,8 +69,8 @@ func TestCalculateStatisticsMedianRangesCoverageAndMarketCounts(t *testing.T) {
 	if got.Currency != "RUB" {
 		t.Errorf("Currency = %q, want RUB", got.Currency)
 	}
-	if got.EntryLevelCount != 4 || got.EntryLevelPercent != 67 {
-		t.Errorf("entry level count/percent = %d/%d, want 4/67", got.EntryLevelCount, got.EntryLevelPercent)
+	if got.EntryLevelCount != 3 || got.EntryLevelPercent != 50 {
+		t.Errorf("entry level count/percent = %d/%d, want 3/50", got.EntryLevelCount, got.EntryLevelPercent)
 	}
 	if got.RemoteCount != 2 || got.RemotePercent != 33 {
 		t.Errorf("remote count/percent = %d/%d, want 2/33", got.RemoteCount, got.RemotePercent)
@@ -98,8 +102,9 @@ func TestCalculateStatisticsMedianOddAndEven(t *testing.T) {
 		values []int64
 		want   int64
 	}{
-		{name: "odd", values: []int64{100, 20, 10}, want: 20},
-		{name: "even", values: []int64{40, 10, 30, 20}, want: 25},
+		{name: "odd", values: []int64{100, 20, 10, 30, 40}, want: 30},
+		{name: "even", values: []int64{60, 10, 50, 20, 40, 30}, want: 35},
+		{name: "overflow-safe even", values: []int64{math.MaxInt64 - 5, math.MaxInt64 - 4, math.MaxInt64 - 3, math.MaxInt64 - 2, math.MaxInt64 - 1, math.MaxInt64}, want: math.MaxInt64 - 3},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -130,6 +135,8 @@ func TestSalaryObservationHandlesRangesAndMissingValues(t *testing.T) {
 		{name: "negative values", from: salaryValue(-1), to: salaryValue(-2)},
 		{name: "valid from invalid to", from: salaryValue(50000), to: salaryValue(0), want: 50000},
 		{name: "invalid from valid to", from: salaryValue(0), to: salaryValue(90000), want: 90000},
+		{name: "overflow-safe range", from: salaryValue(math.MaxInt64 - 2), to: salaryValue(math.MaxInt64), want: math.MaxInt64 - 1},
+		{name: "reversed range", from: salaryValue(90000), to: salaryValue(50000)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -153,8 +160,8 @@ func TestCalculateStatisticsWithNoSalaryData(t *testing.T) {
 	if got.SalaryMedian != nil || got.SalaryMin != nil || got.SalaryMax != nil {
 		t.Errorf("salary values must be nil: %+v", got)
 	}
-	if got.Currency != "RUB" {
-		t.Errorf("Currency = %q, want fallback RUB", got.Currency)
+	if got.Currency != "" {
+		t.Errorf("Currency = %q, want no inferred currency", got.Currency)
 	}
 	if !got.SmallSample {
 		t.Error("SmallSample = false, want true")
@@ -189,9 +196,9 @@ func TestCalculateStatisticsDoesNotMixCurrencies(t *testing.T) {
 	if got.SalarySampleCount != 3 {
 		t.Errorf("SalarySampleCount = %d, want 3", got.SalarySampleCount)
 	}
-	assertInt64Pointer(t, "SalaryMedian", got.SalaryMedian, 3000)
-	assertInt64Pointer(t, "SalaryMin", got.SalaryMin, 1000)
-	assertInt64Pointer(t, "SalaryMax", got.SalaryMax, 5000)
+	if got.SalaryMedian != nil || got.SalaryMin != nil || got.SalaryMax != nil || got.SalaryReliable {
+		t.Errorf("salary aggregate must be hidden below minimum sample: %+v", got)
+	}
 }
 
 func TestDominantCurrencyHasDeterministicTieBreak(t *testing.T) {
@@ -203,8 +210,56 @@ func TestDominantCurrencyHasDeterministicTieBreak(t *testing.T) {
 			t.Fatalf("dominantCurrency tie = %q, want EUR", got)
 		}
 	}
-	if got := dominantCurrency(nil); got != "RUB" {
-		t.Errorf("dominantCurrency(nil) = %q, want RUB", got)
+	if got := dominantCurrency(nil); got != "" {
+		t.Errorf("dominantCurrency(nil) = %q, want empty", got)
+	}
+}
+
+func TestCalculateStatisticsDoesNotInferMissingCurrency(t *testing.T) {
+	t.Parallel()
+
+	got := CalculateStatistics([]Vacancy{
+		{SalaryFrom: salaryValue(50_000)},
+		{SalaryFrom: salaryValue(60_000), Currency: "RUB"},
+	})
+	if got.SalaryCount != 2 || got.SalaryUnknownCurrencyCount != 1 || got.SalaryCoveragePercent != 100 {
+		t.Fatalf("unknown currency handling = %+v", got)
+	}
+	if got.Currency != "RUB" || got.SalaryMedian != nil {
+		t.Fatalf("unsafe salary aggregate = %+v", got)
+	}
+}
+
+func TestCalculateStatisticsNeverAggregatesUnknownCurrency(t *testing.T) {
+	t.Parallel()
+
+	items := make([]Vacancy, 0, MinimumSalarySample)
+	for i := 0; i < MinimumSalarySample; i++ {
+		items = append(items, Vacancy{SalaryFrom: salaryValue(int64(50_000 + i*1_000))})
+	}
+	got := CalculateStatistics(items)
+	if got.SalaryUnknownCurrencyCount != MinimumSalarySample || got.SalarySampleCount != 0 || got.SalaryReliable || got.SalaryMedian != nil {
+		t.Fatalf("unknown currencies were aggregated: %+v", got)
+	}
+}
+
+func TestCalculateStatisticsSeparatesNoExperienceFromUnknown(t *testing.T) {
+	t.Parallel()
+
+	got := CalculateStatistics([]Vacancy{
+		{ExperienceYears: experienceValue(0)},
+		{ExperienceYears: experienceValue(1)},
+		{},
+		{},
+	})
+	if got.NoExperienceCount != 1 || got.NoExperiencePercent != 25 {
+		t.Errorf("no-experience = %d/%d%%", got.NoExperienceCount, got.NoExperiencePercent)
+	}
+	if got.ExperienceUnknownCount != 2 || got.ExperienceUnknownPercent != 50 {
+		t.Errorf("unknown experience = %d/%d%%", got.ExperienceUnknownCount, got.ExperienceUnknownPercent)
+	}
+	if got.EntryLevelCount != 2 || got.EntryLevelPercent != 50 {
+		t.Errorf("known entry-level = %d/%d%%", got.EntryLevelCount, got.EntryLevelPercent)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"Max-hack/internal/catalog"
 	"Max-hack/internal/maxapi"
 )
 
@@ -31,9 +32,16 @@ func TestMessageWithRestartAlwaysAddsOneRestartButton(t *testing.T) {
 	}
 }
 
+func TestHandlerCatalogPolicyDefaultsToPilot(t *testing.T) {
+	h := NewHandler(newFakeMessenger(), loadTestCatalog(t), nil, nil, AnalysisConfig{})
+	if h.catalogPolicy != catalog.ReviewPolicyPilot {
+		t.Fatalf("default catalog policy = %q, want %q", h.catalogPolicy, catalog.ReviewPolicyPilot)
+	}
+}
+
 func TestRepeatedQualificationSelectionKeepsCurrentActions(t *testing.T) {
 	cat := loadTestCatalog(t)
-	h := NewHandler(newFakeMessenger(), cat, nil, nil, AnalysisConfig{})
+	h := NewHandler(newFakeMessenger(), cat, nil, nil, withAllCatalog(AnalysisConfig{}))
 	program, ok := cat.Get("09.02.07")
 	if !ok || len(program.Qualifications) == 0 {
 		t.Fatal("test program or qualification not found")
@@ -76,7 +84,7 @@ func TestBeginCallbackIncludesRestartButton(t *testing.T) {
 }
 
 func TestReadyKeyboardDoesNotShowProgramSourceButton(t *testing.T) {
-	h := NewHandler(newFakeMessenger(), loadTestCatalog(t), nil, nil, AnalysisConfig{})
+	h := NewHandler(newFakeMessenger(), loadTestCatalog(t), nil, nil, withAllCatalog(AnalysisConfig{}))
 	rows := h.readyKeyboard(session{Generation: 2, ProgramCode: "09.02.07"})
 
 	for _, row := range rows {
@@ -86,9 +94,72 @@ func TestReadyKeyboardDoesNotShowProgramSourceButton(t *testing.T) {
 			}
 		}
 	}
-	if !hasCallbackPrefix(rows, payloadAnalyze) || !hasCallback(rows, payloadRestart) {
+	if !hasCallbackPrefix(rows, payloadAnalyze) || !hasCallback(rows, payloadRestart) || !hasCallback(rows, payloadProgram) || !hasCallback(rows, payloadRegion) {
 		t.Fatalf("ready keyboard lost required actions: %#v", rows)
 	}
+}
+
+func TestPilotPolicyRejectsProgramFromRestoredSearch(t *testing.T) {
+	cat := loadTestCatalog(t)
+	h := NewHandler(newFakeMessenger(), cat, nil, nil, AnalysisConfig{CatalogPolicy: catalog.ReviewPolicyPilot})
+	h.sessions.set(81, session{
+		Step: stepAwaitProgram, Generation: 5, RegionCode: "7700000000000", RegionName: "Москва",
+		SearchPrograms: []string{"09.02.07"},
+	})
+
+	text, rows, _ := h.selectProgram(81, "09.02.07")
+	if !strings.Contains(text, "проверенный пилотный набор") {
+		t.Fatalf("unexpected rejection text: %q", text)
+	}
+	if hasCallbackPrefix(rows, payloadAnalyze) {
+		t.Fatalf("rejected program exposed analyze action: %#v", rows)
+	}
+	if got := h.sessions.get(81).Step; got != stepAwaitProgram {
+		t.Fatalf("rejected program changed step to %q", got)
+	}
+
+	readyRows := h.readyKeyboard(session{Step: stepReady, Generation: 5, ProgramCode: "09.02.07"})
+	if hasCallbackPrefix(readyRows, payloadAnalyze) {
+		t.Fatalf("restored unreviewed program exposed analyze action: %#v", readyRows)
+	}
+}
+
+func TestProgramSearchCanShowMoreThanEightResults(t *testing.T) {
+	cat := loadTestCatalog(t)
+	h := NewHandler(newFakeMessenger(), cat, nil, nil, withAllCatalog(AnalysisConfig{}))
+	hits := cat.Search("и", maxSearchTotal)
+	if len(hits) <= maxSearchHits {
+		t.Fatalf("catalog query returned %d programs; test needs pagination", len(hits))
+	}
+	codes := make([]string, 0, len(hits))
+	for _, program := range hits {
+		codes = append(codes, program.Code)
+	}
+	text, rows := h.programChoices(session{Generation: 4, SearchPrograms: codes}, 0)
+	if strings.Count(text, "• ") != maxSearchHits {
+		t.Fatalf("first page text = %q", text)
+	}
+	if !hasCallbackPrefix(rows, payloadMoreProg) {
+		t.Fatalf("first page has no show-more button: %#v", rows)
+	}
+}
+
+func TestPrivacyCommandDoesNotRequestPersonalData(t *testing.T) {
+	messenger := newFakeMessenger()
+	h := NewHandler(messenger, loadTestCatalog(t), nil, nil, AnalysisConfig{})
+	update := maxapi.Update{
+		UpdateType: maxapi.UpdateMessageCreated,
+		ChatID:     77,
+		Message:    &maxapi.Message{Body: maxapi.MessageBody{Text: "/privacy"}},
+	}
+	if err := h.Handle(t.Context(), update); err != nil {
+		t.Fatal(err)
+	}
+	message := receive(t, messenger.messages)
+	if message.body.Text == nil || !strings.Contains(*message.body.Text, "/forget") || !strings.Contains(*message.body.Text, "Не отправляй") {
+		t.Fatalf("unexpected privacy response: %#v", message.body.Text)
+	}
+	assertRestartMessage(t, message.body)
 }
 
 func assertRestartMessage(t *testing.T, body maxapi.NewMessageBody) {
