@@ -205,7 +205,7 @@ docker compose --profile observability down
 
 Pull request и push в `main`/`master` проходят formatting check, `go vet`, lint, race/coverage tests, `govulncheck`, поиск секретов/уязвимостей, валидацию полного Compose-профиля и Prometheus, сборку образа и smoke-test мигратора. Проверенный образ экспортируется как артефакт с SHA-256 и при deploy загружается на сервер без повторной сборки, поэтому в production запускается именно просканированный образ этого commit SHA. Deploy создаёт каталог релиза и ожидает `/readyz`. Для релиза без новых миграций при ошибке автоматически поднимается предыдущая версия и отдельно проверяется её готовность. Перед изменением схемы workflow гарантированно запускает существующую БД и создаёт AES-256-зашифрованный `pg_dump` в `/opt/max-bot/backups`; если backup получить нельзя, релиз останавливается до миграции. Автооткат бинарника при изменившейся схеме намеренно не выполняется.
 
-Нужны GitHub Secrets: `SERVER_HOST`, `SERVER_USER`, `SERVER_SSH_KEY`, проверенный SHA-256 host key в `SERVER_FINGERPRINT` и отдельный стойкий `BACKUP_ENCRYPTION_PASSWORD`. На сервере должны быть Docker с Compose v2.20+, Bash, OpenSSL, curl, `diff`, `find`, `grep` и GNU coreutils, а также существовать `/opt/max-bot/.env`; workflow не копирует и не выводит этот файл. Утраченный пароль backup восстановить нельзя — храните его в защищённом резервном хранилище.
+Нужны GitHub Secrets: `SERVER_HOST`, `SERVER_USER` и `SERVER_SSH_KEY`. SHA-256 fingerprint production-сервера закреплён в workflow; при ротации host key его нужно отдельно сверить и обновить в коде. На сервере должны быть Docker с Compose v2.20+, Bash, OpenSSL, curl, `diff`, `find`, `grep` и GNU coreutils, а также существовать `/opt/max-bot/.env`; workflow не копирует и не выводит этот файл. При первой резервной копии workflow атомарно создаёт `/opt/max-bot/secrets/backup-encryption.key` с правами `0600`. Если ключ пропал, но зашифрованные backup остались, deploy остановится и не заменит ключ молча. Копию этого ключа нужно хранить во внешнем защищённом хранилище: без него backup восстановить нельзя.
 
 После успешного deploy зашифрованные backup, каталоги старых релизов и неиспользуемые образы SkillGap старше 30 дней удаляются. Текущий и непосредственно предыдущий каталог релиза сохраняются независимо от возраста.
 
@@ -213,18 +213,16 @@ Pull request и push в `main`/`master` проходят formatting check, `go v
 
 ```bash
 cd /opt/max-bot/current
-export BACKUP_ENCRYPTION_PASSWORD='значение-из-защищённого-хранилища'
 sha256sum -c /opt/max-bot/backups/before-COMMIT_SHA.dump.enc.sha256
 docker compose -p max-bot --env-file /opt/max-bot/.env exec -T db \
   sh -c 'createdb --username="$POSTGRES_USER" skillgap_restore_check'
 openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
-  -pass env:BACKUP_ENCRYPTION_PASSWORD \
+  -pass file:/opt/max-bot/secrets/backup-encryption.key \
   -in /opt/max-bot/backups/before-COMMIT_SHA.dump.enc | \
 docker compose -p max-bot --env-file /opt/max-bot/.env exec -T db \
   sh -c 'pg_restore --exit-on-error --no-owner --username="$POSTGRES_USER" --dbname=skillgap_restore_check'
 docker compose -p max-bot --env-file /opt/max-bot/.env exec -T db \
   sh -c 'dropdb --username="$POSTGRES_USER" skillgap_restore_check'
-unset BACKUP_ENCRYPTION_PASSWORD
 ```
 
 Замените `COMMIT_SHA` на имя нужного файла. Workflow создаёт рядом SHA-256 checksum для обнаружения случайной порчи. AES-256-CBC защищает конфиденциальность backup, но эта незаверенная checksum не защищает от целевой подмены обоих файлов и не заменяет регулярный restore drill; переносите резервную копию и checksum в защищённое backup-хранилище.

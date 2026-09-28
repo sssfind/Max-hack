@@ -179,6 +179,8 @@ jobs:
     concurrency:
       group: skillgap-production
       cancel-in-progress: false
+    env:
+      PRODUCTION_SSH_FINGERPRINT: "SHA256:05P2k37kkUqSmF/buV2tg/0j9dXTEY33ZyDLrvgje4U"
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -191,20 +193,27 @@ jobs:
       - name: Verify image artifact checksum
         run: sha256sum --check skillgap-image.tar.gz.sha256
 
-      - name: Verify deployment secrets
+      - name: Verify deployment credentials
         shell: bash
         env:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
           SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
-          SERVER_FINGERPRINT: ${{ secrets.SERVER_FINGERPRINT }}
-          BACKUP_ENCRYPTION_PASSWORD: ${{ secrets.BACKUP_ENCRYPTION_PASSWORD }}
         run: |
           test -n "$SERVER_HOST"
           test -n "$SERVER_USER"
           test -n "$SERVER_SSH_KEY"
-          test -n "$SERVER_FINGERPRINT"
-          test -n "$BACKUP_ENCRYPTION_PASSWORD"
+          [[ "$PRODUCTION_SSH_FINGERPRINT" =~ ^SHA256:[A-Za-z0-9+/]{43}$ ]]
+
+      - name: Verify production SSH host
+        uses: appleboy/ssh-action@823bd89e131d8d508129f9443cad5855e9ba96f0 # v1.2.4
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          fingerprint: ${{ env.PRODUCTION_SSH_FINGERPRINT }}
+          command_timeout: 30s
+          script: "true"
 
       - name: Upload immutable release
         uses: appleboy/scp-action@ff85246acaad7bdce478db94a363cd2bf7c90345 # v1.0.0
@@ -212,22 +221,18 @@ jobs:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
-          fingerprint: ${{ secrets.SERVER_FINGERPRINT }}
+          fingerprint: ${{ env.PRODUCTION_SSH_FINGERPRINT }}
           source: "cmd,internal,deploy,spo_program_vacancy_map.json,go.mod,go.sum,Dockerfile,docker-compose.yml,prometheus.yml,README.md,.env.example,.dockerignore,THIRD_PARTY_NOTICES,skillgap-image.tar.gz,skillgap-image.tar.gz.sha256"
           target: /opt/max-bot/releases/${{ github.sha }}
           overwrite: true
 
       - name: Start release and verify readiness
         uses: appleboy/ssh-action@823bd89e131d8d508129f9443cad5855e9ba96f0 # v1.2.4
-        env:
-          BACKUP_ENCRYPTION_PASSWORD: ${{ secrets.BACKUP_ENCRYPTION_PASSWORD }}
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
-          fingerprint: ${{ secrets.SERVER_FINGERPRINT }}
-          envs: BACKUP_ENCRYPTION_PASSWORD
-          script_stop: true
+          fingerprint: ${{ env.PRODUCTION_SSH_FINGERPRINT }}
           command_timeout: 15m
           script: |
             bash -se <<'SKILLGAP_DEPLOY'
@@ -236,6 +241,9 @@ jobs:
             release_root=/opt/max-bot/releases
             release_dir="${release_root}/${{ github.sha }}"
             env_file=/opt/max-bot/.env
+            secrets_dir=/opt/max-bot/secrets
+            backup_key_file="${secrets_dir}/backup-encryption.key"
+            backup_dir=/opt/max-bot/backups
             retention_days=30
             retention_hours=720
 
@@ -276,14 +284,46 @@ jobs:
             fi
 
             if [ "$schema_changed" -eq 1 ] && [ -n "$previous_dir" ] && [ -f "$previous_dir/docker-compose.yml" ]; then
-              test -n "${BACKUP_ENCRYPTION_PASSWORD:-}" || {
-                echo "BACKUP_ENCRYPTION_PASSWORD is required for a schema-changing release" >&2
+              umask 077
+              mkdir -p "$secrets_dir"
+              test "$(readlink -f "$secrets_dir")" = "$secrets_dir"
+              chmod 700 "$secrets_dir"
+              if [ ! -e "$backup_key_file" ]; then
+                if [ -d "$backup_dir" ] && \
+                  find "$backup_dir" -maxdepth 1 -type f \
+                    \( -name 'before-*.dump.enc' -o -name 'before-*.dump.enc.sha256' \) \
+                    -print -quit | grep -q .; then
+                  echo "Backup encryption key is missing while encrypted backups still exist" >&2
+                  exit 1
+                fi
+                temporary_key="$(mktemp "${secrets_dir}/.backup-encryption.key.XXXXXX")"
+                cleanup_backup_key_temporary() {
+                  rm -f -- "$temporary_key"
+                }
+                trap cleanup_backup_key_temporary EXIT
+                openssl rand -hex 32 >"$temporary_key"
+                chmod 600 "$temporary_key"
+                if ! ln "$temporary_key" "$backup_key_file" 2>/dev/null; then
+                  test -f "$backup_key_file"
+                fi
+                trap - EXIT
+                cleanup_backup_key_temporary
+                echo "Created backup encryption key; copy it to protected external storage" >&2
+              fi
+              if [ -L "$backup_key_file" ] || [ ! -f "$backup_key_file" ]; then
+                echo "Backup encryption key is not a regular file" >&2
                 exit 1
-              }
+              fi
+              chmod 600 "$backup_key_file"
+              if [ "$(wc -c <"$backup_key_file")" -ne 65 ] || \
+                [ "$(wc -l <"$backup_key_file")" -ne 1 ] || \
+                ! grep -Eq '^[0-9a-f]{64}$' "$backup_key_file"; then
+                echo "Backup encryption key has an invalid format" >&2
+                exit 1
+              fi
+
               cd "$previous_dir"
               docker compose -p max-bot --env-file "$env_file" up -d --wait db
-              umask 077
-              backup_dir=/opt/max-bot/backups
               mkdir -p "$backup_dir"
               test "$(readlink -f "$backup_dir")" = /opt/max-bot/backups
               # EXIT traps cover ordinary failures. Also reap abandoned
@@ -328,7 +368,7 @@ jobs:
                 docker compose -p max-bot --env-file "$env_file" exec -T db \
                   sh -c 'pg_dump --format=custom --username="$POSTGRES_USER" "$POSTGRES_DB"' | \
                   openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 \
-                    -pass env:BACKUP_ENCRYPTION_PASSWORD -out "$temporary_backup"
+                    -pass file:"$backup_key_file" -out "$temporary_backup"
                 test -s "$temporary_backup"
                 checksum="$(sha256sum "$temporary_backup" | awk '{print $1}')"
                 printf '%s  %s\n' "$checksum" "$(basename "$backup_file")" >"$temporary_checksum"
@@ -399,7 +439,6 @@ jobs:
             mv -Tf /opt/max-bot/current.next /opt/max-bot/current
             docker compose -p max-bot --env-file "$env_file" ps
 
-            backup_dir=/opt/max-bot/backups
             if [ -d "$backup_dir" ]; then
               test "$(readlink -f "$backup_dir")" = "$backup_dir"
               find "$backup_dir" -maxdepth 1 -type f \
