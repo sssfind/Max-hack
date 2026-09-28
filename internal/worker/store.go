@@ -403,7 +403,7 @@ func (s postgresEventSession) fail(ctx context.Context, key, message string, nex
 		SET status = CASE WHEN $4 THEN 'dead' ELSE 'failed' END,
 			failed_at = COALESCE(failed_at, NOW()), updated_at = NOW(),
 			processing_started_at = NULL,
-			next_attempt_at = CASE WHEN $4 THEN NULL ELSE $2 END,
+			next_attempt_at = CASE WHEN $4 THEN NULL ELSE $2::timestamptz END,
 			last_error = $3
 		WHERE event_key = $1 AND status = 'processing'
 	`, key, nextAttempt, message, terminal)
