@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
-	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +19,7 @@ import (
 const (
 	pdfWorkerModeEnv   = "SKILLGAP_INTERNAL_PDF_WORKER"
 	pdfWorkerModeValue = "1"
+	pdfWorkerMemoryEnv = "SKILLGAP_INTERNAL_PDF_MEMORY_LIMIT"
 
 	minPDFWorkerMemory = int64(128 << 20)
 	maxPDFWorkerMemory = int64(2 << 30)
@@ -68,6 +68,19 @@ func init() {
 	// diagnostics away from it so they cannot corrupt the response.
 	protocolOutput := os.Stdout
 	os.Stdout = os.Stderr
+	memoryLimit, err := pdfWorkerMemoryLimitFromEnvironment()
+	if err != nil {
+		os.Exit(writePDFWorkerResponse(protocolOutput, pdfWorkerResponse{
+			ErrorKind: "parse_limit",
+			Error:     "invalid isolated PDF parser memory limit",
+		}))
+	}
+	if err := applyPDFWorkerMemoryLimit(memoryLimit); err != nil {
+		os.Exit(writePDFWorkerResponse(protocolOutput, pdfWorkerResponse{
+			ErrorKind: "parse_limit",
+			Error:     "could not apply isolated PDF parser memory limit",
+		}))
+	}
 	os.Exit(servePDFWorker(os.Stdin, protocolOutput))
 }
 
@@ -111,7 +124,7 @@ func parsePDFIsolated(ctx context.Context, payload []byte, fileName string, opts
 
 	workerCtx, cancel := context.WithTimeout(ctx, parseTimeout)
 	defer cancel()
-	command := newPDFWorkerCommand(workerCtx, executable, memoryLimit, parseTimeout)
+	command := newPDFWorkerCommand(workerCtx, executable, parseTimeout)
 	command.Env = pdfWorkerEnvironment(memoryLimit)
 	command.Stdin = io.MultiReader(bytes.NewReader(header), bytes.NewReader(payload))
 	stdout := newCappedBuffer(pdfWorkerOutputLimit(opts.MaxTextBytes, opts.MaxPages))
@@ -154,32 +167,18 @@ func parsePDFIsolated(ctx context.Context, payload []byte, fileName string, opts
 	return fragments, nil
 }
 
-func newPDFWorkerCommand(ctx context.Context, executable string, memoryLimit int64, timeout time.Duration) *exec.Cmd {
-	if runtime.GOOS != "linux" || pdfRaceEnabled || pdfCoverageEnabled() {
+func newPDFWorkerCommand(ctx context.Context, executable string, timeout time.Duration) *exec.Cmd {
+	if runtime.GOOS != "linux" || pdfRaceEnabled {
 		return exec.CommandContext(ctx, executable)
 	}
 
-	// Apply limits in the shell before exec starts the Go runtime. Applying an
-	// address-space limit from Go itself is too late because the runtime may
-	// already have reserved a large arena. /bin/sh is present in the production
-	// Alpine image and on the Linux CI runners.
-	memoryKB := strconv.FormatInt(memoryLimit/1024, 10)
+	// The CPU limit can be applied before exec. The address-space budget is
+	// applied by the initialized worker, after the Go runtime's baseline virtual
+	// mappings are present, so that the configured budget belongs to the parser.
+	// /bin/sh is present in the production Alpine image and Linux CI runners.
 	cpuSeconds := strconv.FormatInt(maxInt64(1, (timeout.Milliseconds()+999)/1000), 10)
-	const script = `ulimit -v "$1" && ulimit -t "$2" && exec "$3"`
-	return exec.CommandContext(ctx, "/bin/sh", "-c", script, "skillgap-pdf-worker", memoryKB, cpuSeconds, executable)
-}
-
-func pdfCoverageEnabled() bool {
-	buildInfo, ok := debug.ReadBuildInfo()
-	if !ok {
-		return false
-	}
-	for _, setting := range buildInfo.Settings {
-		if setting.Key == "-cover" && setting.Value == "true" {
-			return true
-		}
-	}
-	return false
+	const script = `ulimit -t "$1" && exec "$2"`
+	return exec.CommandContext(ctx, "/bin/sh", "-c", script, "skillgap-pdf-worker", cpuSeconds, executable)
 }
 
 func pdfWorkerEnvironment(memoryLimit int64) []string {
@@ -188,6 +187,7 @@ func pdfWorkerEnvironment(memoryLimit int64) []string {
 	// worker needs no inherited environment at all.
 	environment := []string{
 		pdfWorkerModeEnv + "=" + pdfWorkerModeValue,
+		pdfWorkerMemoryEnv + "=" + strconv.FormatInt(memoryLimit, 10),
 		"GOMEMLIMIT=" + strconv.FormatInt(memoryLimit*3/5, 10) + "B",
 		"GOGC=50",
 		"GOTRACEBACK=none",
@@ -198,6 +198,33 @@ func pdfWorkerEnvironment(memoryLimit int64) []string {
 		}
 	}
 	return environment
+}
+
+func pdfWorkerMemoryLimitFromEnvironment() (int64, error) {
+	memoryLimit, err := strconv.ParseInt(os.Getenv(pdfWorkerMemoryEnv), 10, 64)
+	if err != nil || memoryLimit < minPDFWorkerMemory || memoryLimit > maxPDFWorkerMemory {
+		return 0, errors.New("invalid isolated PDF parser memory limit")
+	}
+	return memoryLimit, nil
+}
+
+func pdfWorkerAddressSpaceLimit(currentVirtualBytes uint64, memoryLimit int64, existingLimit uint64) (uint64, error) {
+	if memoryLimit <= 0 {
+		return 0, errors.New("isolated PDF parser memory limit must be positive")
+	}
+	budget := uint64(memoryLimit)
+	if currentVirtualBytes > ^uint64(0)-budget {
+		return 0, errors.New("worker address-space limit overflows")
+	}
+	target := currentVirtualBytes + budget
+	// Never loosen a stricter limit imposed by the container or operator.
+	if existingLimit < target {
+		target = existingLimit
+	}
+	if target <= currentVirtualBytes {
+		return 0, errors.New("existing address-space limit leaves no parser budget")
+	}
+	return target, nil
 }
 
 func servePDFWorker(input io.Reader, output io.Writer) int {

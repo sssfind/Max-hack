@@ -179,13 +179,6 @@ func TestAnalyzePDFProvidesPageEvidence(t *testing.T) {
 	}
 }
 
-func TestPDFCoverageInstrumentationDetected(t *testing.T) {
-	want := testing.CoverMode() != ""
-	if got := pdfCoverageEnabled(); got != want {
-		t.Fatalf("pdfCoverageEnabled() = %v, want %v for cover mode %q", got, want, testing.CoverMode())
-	}
-}
-
 func TestPDFPageLimit(t *testing.T) {
 	t.Parallel()
 	payload := makePDF(t, "one", "two")
@@ -217,27 +210,26 @@ func TestHighlyCompressiblePDFStreamHonorsTextLimit(t *testing.T) {
 }
 
 func TestPDFDecompressionBombIsContainedByWorker(t *testing.T) {
-	if runtime.GOOS != "linux" || pdfRaceEnabled || pdfCoverageEnabled() {
-		t.Skip("hard RLIMIT_AS regression applies to plain Linux production builds")
+	if runtime.GOOS != "linux" || pdfRaceEnabled {
+		t.Skip("hard RLIMIT_AS regression applies to non-race Linux builds")
 	}
 
 	options := Options{
 		MaxPages:          1,
 		MaxTextBytes:      1 << 20,
 		PDFParseTimeout:   15 * time.Second,
-		PDFMaxMemoryBytes: 512 << 20,
+		PDFMaxMemoryBytes: minPDFWorkerMemory,
 	}
-	// Prove the configured limit is large enough to start this test executable;
-	// otherwise an immediate loader failure could make the bomb assertion a
-	// false positive.
+	// Prove the initialized worker and the minimum supported parser budget can
+	// handle a normal document; otherwise the bomb assertion is a false positive.
 	if _, err := parsePDF(context.Background(), makePDF(t, "small PDF"), "small.pdf", options); err != nil {
 		t.Fatalf("bounded worker could not parse a normal PDF: %v", err)
 	}
 
-	// The compressed stream is under a megabyte, but its single PDF string token
-	// expands well beyond the worker's address-space limit. Older in-process
+	// The compressed stream is only a few megabytes, but its single PDF string
+	// token expands well beyond the worker's parser budget. Older in-process
 	// parsing allowed this allocation to threaten the whole bot process.
-	payload := makeHighlyCompressiblePDF(t, 640<<20)
+	payload := makeHighlyCompressiblePDF(t, options.PDFMaxMemoryBytes+(512<<20))
 	started := time.Now()
 	_, err := parsePDF(context.Background(), payload, "bomb.pdf", options)
 	if !errors.Is(err, ErrParseLimit) {
