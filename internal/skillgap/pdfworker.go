@@ -139,14 +139,14 @@ func parsePDFIsolated(ctx context.Context, payload []byte, fileName string, opts
 	if errors.Is(workerCtx.Err(), context.DeadlineExceeded) {
 		return nil, fmt.Errorf("%w: isolated PDF parser exceeded %s", ErrParseLimit, parseTimeout)
 	}
-	if stdout.overflowed || stderr.overflowed {
-		return nil, fmt.Errorf("%w: isolated PDF parser exceeded its output limit", ErrParseLimit)
-	}
 	if runErr != nil {
 		// A hard address-space or CPU limit terminates the worker without a
 		// protocol response. Treat every abnormal worker exit as a parse limit;
 		// the untrusted document must never take down the bot process.
 		return nil, fmt.Errorf("%w: isolated PDF parser terminated", ErrParseLimit)
+	}
+	if stdout.overflowed || stderr.overflowed {
+		return nil, fmt.Errorf("%w: isolated PDF parser exceeded its output limit", ErrParseLimit)
 	}
 
 	var response pdfWorkerResponse
