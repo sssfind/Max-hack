@@ -13,14 +13,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
-      - name: Read ED25519 host key
+      - name: Read ECDSA host key
         shell: bash
         env:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
         run: |
           set -euo pipefail
           test -n "$SERVER_HOST"
-          key="$(ssh-keyscan -T 10 -t ed25519 "$SERVER_HOST" 2>/dev/null)"
+          key="$(ssh-keyscan -T 10 -t ecdsa "$SERVER_HOST" 2>/dev/null)"
           test -n "$key"
           fingerprint="$(printf '%s\n' "$key" | ssh-keygen -lf - -E sha256 | awk 'NR == 1 {print $2}')"
           case "$fingerprint" in
