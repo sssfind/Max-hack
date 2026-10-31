@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM golang:1.26.8-alpine3.24@sha256:8ac98ca534ac3f51e1f420a1dd2c15e74c75cfa0f23f3ad27eb5d7236c349a0c AS builder
+FROM golang:1.27.3-alpine3.24@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb AS builder
 
 ARG TARGETOS=linux
 ARG TARGETARCH
@@ -26,7 +26,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" \
     go build -trimpath -mod=readonly -ldflags="-s -w -buildid=" -o /out/migrator ./cmd/migrator
 
-FROM alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+FROM alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
 
 LABEL org.opencontainers.image.title="SkillGap" \
       org.opencontainers.image.description="MAX bot for transparent vocational-program and labour-market analysis"
